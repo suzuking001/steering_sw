@@ -297,7 +297,7 @@ void firmwareStatus(JsonObject out) {
   const auto status = statusSnapshot();
   out["version"] = SW_FIRMWARE_VERSION;
   out["repository"] = kGithubRepository;
-  out["availableVersion"] = status.release.version;
+  out["availableVersion"] = std::string(status.release.version);
   out["stage"] = names[static_cast<unsigned>(status.stage)];
   out["message"] = status.message;
   out["received"] = status.received;
