@@ -12,9 +12,9 @@ struct Guard {
 int median(const int* values) { int v[5]; std::copy(values, values + 5, v); std::sort(v, v + 5); return v[2]; }
 Step chord(int key, int modifiers) { Step s; s.type = "chord"; s.key = key; s.modifiers = modifiers; return s; }
 }
-void Runtime::begin(const Config& cfg, const String& passcode) {
+bool Runtime::begin(const Config& cfg, const String& passcode) {
   mutex_ = xSemaphoreCreateMutex();
-  if (!mutex_) { Serial.println("FATAL: Cannot allocate runtime mutex"); for (;;) delay(1000); }
+  if (!mutex_) return false;
   cfg_ = cfg; passcode_ = passcode;
   pinMode(ledPin, OUTPUT); digitalWrite(ledPin, LOW);
   analogReadResolution(12);
@@ -26,9 +26,11 @@ void Runtime::begin(const Config& cfg, const String& passcode) {
     TickType_t wake = xTaskGetTickCount();
     for (;;) { self->tick(); vTaskDelayUntil(&wake, pdMS_TO_TICKS(5)); }
   }, "switch-input", 12288, this, 2, nullptr, 1);
-  if (created != pdPASS) { Serial.println("FATAL: Cannot start input task"); for (;;) delay(1000); }
+  if (created != pdPASS) { vSemaphoreDelete(mutex_); mutex_ = nullptr; return false; }
   log("起動。未押下状態を確認してから操作を受け付けます");
+  return true;
 }
+bool Runtime::hasSamples() { Guard lock(mutex_); return samples_ != 0; }
 void Runtime::resetEngines() {
   for (auto& engine : engines_) engine.reset();
   for (auto& r : readings_) r.recognized = kUnknown;

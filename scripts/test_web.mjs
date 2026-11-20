@@ -15,6 +15,8 @@ let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,r
 const savedWifiRequests=[],saveOrder=[];
 let state=fixture(),learning=null,learningAt=0,passcodeSet=false,testedActions=[];
 let key2Millivolts=2750;
+const firmware={repository:'suzuking001/steering_sw',version:'1.0.1',availableVersion:'',stage:'idle',tokenSet:false,received:0,size:0,message:'',bootChecking:false};
+const firmwareRequests=[];
 const errors=[];let checks=0;
 function check(condition,message){assert.ok(condition,message);checks++;console.log('PASS '+message);}
 const csp="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'";
@@ -35,7 +37,7 @@ const server=http.createServer(async(req,res)=>{
       const done=learning&&Date.now()-learningAt>400;
       reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:!bleSuspended,bleReady:!bleSuspended,bleSuspended,busy:false,passcodeSet,accMv:2000,
         readings:state.channels.map((c,i)=>({name:c.name,mode:c.mode,pin:[36,39][i],raw:3890,adc:3890,mv:i===0?3050:key2Millivolts,ohm:i===0?5211:5187,button:'未押下',buttonId:null})),
-        learning:{active:!!learning&&!done,done:!!done,channel:learning?.channel||0,count:400,error:'',remainingMs:done?0:200,center:3895,minimum:3890,maximum:3900,tolerance:15},
+        firmware,learning:{active:!!learning&&!done,done:!!done,channel:learning?.channel||0,count:400,error:'',remainingMs:done?0:200,center:3895,minimum:3890,maximum:3900,tolerance:15},
         wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]});return;
     }
     if(path==='config'&&req.method==='GET'||path==='backup'){reply(200,state);return;}
@@ -49,6 +51,14 @@ const server=http.createServer(async(req,res)=>{
     if(path==='learn/start'){learning={channel:body.channel};learningAt=Date.now();reply(200,{message:'学習開始'});return;}
     if(path==='learn/stop'){learning=null;reply(200,{message:'学習中止'});return;}
     if(path==='test'){testedActions.push(body.action);reply(200,{message:'テストを開始しました'});return;}
+    if(path==='firmware/check'){
+      if(wifiState!=='connected'){reply(409,{error:'更新できません'});return;}
+      firmwareRequests.push(path);firmware.stage='checking';reply(202,{message:'更新確認を開始'});return;
+    }
+    if(path==='firmware/install'){
+      if(firmware.stage!=='available'||body.version!==firmware.availableVersion){reply(409,{error:'更新を確認し直してください'});return;}
+      firmwareRequests.push(body.version);firmware.stage='downloading';reply(202,{message:'更新を開始'});return;
+    }
     if(path==='ble/input-mode'){
       inputModeRequests.push(body);
       if(delayInputMode && body.enabled)await new Promise(resolve=>setTimeout(resolve,400));
@@ -275,6 +285,40 @@ try{
   await wait('!currentStatus.bleSuspended && !inputModeRequest');
   check(inputModeRequests.at(-1).enabled===false,'leaving the page releases the pause');
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'setup-direct.png'),Buffer.from(shot.data,'base64'));
+  await evaluate(`document.getElementById('discard').click()`);
+  check(await evaluate(`document.getElementById('firmware-version').textContent==='1.0.1' &&
+    document.getElementById('firmware-repository').textContent==='suzuking001/steering_sw' &&
+    document.getElementById('firmware-check').disabled && !document.querySelector('#firmware-panel input')`),
+    'firmware panel shows the installed version and the fixed repository');
+  wifiState='connected';
+  await wait('!document.getElementById("firmware-check").disabled');
+  await evaluate(`document.getElementById('firmware-check').click()`);
+  await wait('currentStatus.firmware.stage==="checking"');
+  check(!firmware.tokenSet && firmwareRequests.join(',')==='firmware/check' && await evaluate('document.getElementById("firmware-install").hidden'),
+    'checking for updates starts without a token and does not begin installation');
+  Object.assign(firmware,{stage:'failed',message:'公開リリースが見つかりません。更新元が非公開の場合はGitHubの認証が必要です。'});
+  await wait('document.getElementById("firmware-status").textContent.includes("公開リリースが見つかりません")');
+  check(await evaluate('!document.getElementById("firmware-check").disabled && document.getElementById("firmware-install").hidden'),
+    'an unavailable public release shows an error and leaves the check button enabled');
+  await evaluate(`document.getElementById('firmware-check').click()`);
+  await wait('currentStatus.firmware.stage==="checking"');
+  Object.assign(firmware,{stage:'available',message:'',availableVersion:'1.0.2',size:1500000});
+  await wait('!document.getElementById("firmware-install").hidden');
+  await evaluate(`setDirty();document.getElementById('firmware-install').click()`);
+  check(firmwareRequests.length===2 && await evaluate('document.getElementById("firmware-request-feedback").textContent.includes("未保存")'),
+    'unsaved edits are protected from an update restart');
+  await evaluate(`markSaved();document.getElementById('firmware-install').click()`);
+  await wait('currentStatus.firmware.stage==="downloading"');
+  firmware.received=750000;
+  await wait('document.getElementById("firmware-progress").value===50');
+  check(firmwareRequests.at(-1)==='1.0.2' && await evaluate('!document.getElementById("firmware-progress").hidden && document.getElementById("firmware-check").disabled'),
+    'an explicit install targets the checked version and shows download progress');
+  Object.assign(firmware,{stage:'idle',version:'1.0.2',availableVersion:'',received:0,size:0,bootChecking:true});
+  await wait('document.getElementById("firmware-status").textContent.includes("起動を確認")');
+  firmware.bootChecking=false;
+  await wait('document.getElementById("firmware-status").textContent.includes("更新が完了")');
+  check(await evaluate('document.getElementById("firmware-version").textContent==="1.0.2"'),
+    'success is shown after the new version reports a healthy boot');
   check(errors.length===0,'no uncaught browser or fixture errors');
   console.log(`${checks} browser checks passed; screenshots: .pio/ui-tests/`);
 }catch(error){console.error(error);if(errors.length)console.error(errors);process.exitCode=1;}

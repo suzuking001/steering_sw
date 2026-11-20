@@ -8,6 +8,8 @@
 #include "connection.h"
 #include "access.h"
 #include "network_state.h"
+#include "ota_release.h"
+#include "ota_update.h"
 #include "runtime.h"
 #include "web_assets.h"
 
@@ -16,11 +18,13 @@ namespace {
 WebServer server(80);
 DNSServer portalDns;
 SetupButton setupButton;
-String wifiPassword, apPassword, apName, webCsrf;
+String wifiPassword, apPassword, apName, webCsrf, githubToken;
 String inputModeClient;
 uint32_t inputModeUpdatedAt = 0;
 constexpr uint32_t inputModeTimeoutMs = 15000;
 uint32_t rebootAt = 0;
+uint32_t firmwareBootAt = 0;
+bool verifyFirmware = false, otaOutputPaused = false, inputModePaused = false;
 uint32_t lastApAttempt = 0;
 bool apStarted = false, mdnsStarted = false, wasConnected = false, networkChanged = false;
 NetworkSchedule networkSchedule;
@@ -32,10 +36,13 @@ String announcedIp;
 void headers();
 
 void applyInputMode(bool enabled) {
+  inputModePaused = enabled;
+  enabled = enabled || otaOutputPaused;
   if (hidState.suspended.load() == enabled) return;
   if (enabled) runtime.cancel();
   setHidSuspended(enabled);
-  runtime.log(enabled ? "文字入力のためBluetoothを一時停止しました" : "Bluetoothの再接続を待っています");
+  runtime.log(!enabled ? "Bluetoothの再接続を待っています" :
+              otaOutputPaused ? "更新のためBluetoothを一時停止しました" : "文字入力のためBluetoothを一時停止しました");
 }
 
 void printSetupInfo() {
@@ -86,6 +93,10 @@ bool allowRequest(bool write = false) {
   const bool tokenMatches = !webCsrf.isEmpty() && server.header("X-CSRF-Token") == webCsrf;
   if (!checkAccess(canonical, write, tokenMatches)) {
     response(403, "設定画面を開き直してください"); return false;
+  }
+  if (write && firmwareInstalling()) {
+    response(409, "ファームウェア更新中です。再起動後に操作してください");
+    return false;
   }
   return true;
 }
@@ -190,8 +201,28 @@ void setupRoutes() {
     if (!allowRequest()) { return; }
     JsonDocument d; runtime.status(d.to<JsonObject>());
     networkStatus(d.as<JsonObject>());
+    auto firmware = d["firmware"].to<JsonObject>();
+    firmwareStatus(firmware); firmware["tokenSet"] = !githubToken.isEmpty(); firmware["bootChecking"] = verifyFirmware;
     d["apActive"] = apStarted && WiFi.AP.started(); d["apName"] = apName;
     d["apIp"] = WiFi.softAPIP().toString(); d["freeHeap"] = ESP.getFreeHeap(); jsonResponse(d);
+  });
+  server.on("/api/firmware/check", HTTP_POST, [] {
+    if (!allowRequest(true)) return;
+    if (rebootAt || verifyFirmware) { response(409, "本体の起動確認が完了してから再試行してください"); return; }
+    const char* error = nullptr;
+    if (!startFirmwareCheck(githubToken, error)) { response(409, error); return; }
+    response(202, "更新の確認を開始しました");
+  });
+  server.on("/api/firmware/install", HTTP_POST, [] {
+    if (!allowRequest(true)) return;
+    if (rebootAt || verifyFirmware) { response(409, "本体の起動確認が完了してから再試行してください"); return; }
+    JsonDocument d; if (!body(d, 128)) return;
+    if (!d["version"].is<const char*>()) { response(400, "更新するバージョンを指定してください"); return; }
+    const char* error = nullptr;
+    if (!startFirmwareInstall(githubToken, d["version"].as<String>(), error)) { response(409, error); return; }
+    otaOutputPaused = true;
+    applyInputMode(inputModePaused);
+    response(202, "ファームウェア更新を開始しました");
   });
   server.on("/api/config", HTTP_GET, [] {
     if (!allowRequest()) { return; } auto c = runtime.config(); JsonDocument d; toJson(c, d.to<JsonObject>()); jsonResponse(d);
@@ -337,38 +368,60 @@ void setupRoutes() {
 }
 void serialCommand() {
   static String line;
+  static bool overflow = false;
   for (int i = 0; i < 64 && Serial.available(); ++i) {
     char ch = Serial.read();
     if (ch == '\n' || ch == '\r') {
+      if (overflow) { line = ""; overflow = false; Serial.println("Command too long."); continue; }
       line.trim();
       // Keep older USB commands as harmless aliases for the connection guide.
       if (line == "SETUP" || line == "EASY_SETUP" || line == "RESET_ADMIN") {
         startAP(); printSetupInfo();
       }
-      if (line == "HELP") Serial.println("SETUP: show/start setup Wi-Fi (no Web password); HELP");
+      if (line == "HELP") {
+        Serial.println("SETUP: show/start setup Wi-Fi; GITHUB_TOKEN <fine-grained PAT>: save read-only release access; GITHUB_TOKEN_CLEAR: remove it; HELP");
+      }
+      if (line.startsWith("GITHUB_TOKEN ") || line == "GITHUB_TOKEN_CLEAR") {
+        String token = line == "GITHUB_TOKEN_CLEAR" ? String() : line.substring(13);
+        if (firmwareInstalling()) Serial.println("Firmware update in progress. Try after restart.");
+        else if (!token.isEmpty() && !isGithubToken({token.c_str(), token.length()})) Serial.println("Use a fine-grained GitHub personal access token.");
+        else if (!saveSecret("github", token)) Serial.println("Could not save GitHub token.");
+        else { githubToken = token; Serial.println(token.isEmpty() ? "GitHub token cleared." : "GitHub token registered."); }
+      }
       line = "";
-    } else if (line.length() < 80) line += ch;
+    } else if (line.length() < 192) line += ch;
+    else overflow = true;
   }
+}
+
+void fatalStartup(const char* message) {
+  Serial.println(message);
+  if (verifyFirmware) { rollBackFirmwareBoot(); ESP.restart(); }
+  for (;;) delay(1000);
 }
 
 }
 void setup() {
   Serial.begin(115200); delay(200);
+  verifyFirmware = pendingFirmwareBoot();
+  firmwareBootAt = millis();
   pinMode(0, INPUT_PULLUP);
   Config c; bool restored = loadConfig(c);
   Preferences p;
-  if (!p.begin("sw-secrets", false)) { Serial.println("FATAL: Cannot open NVS. No HID will start."); for (;;) delay(1000); }
+  if (!p.begin("sw-secrets", false)) fatalStartup("FATAL: Cannot open NVS. No HID will start.");
   apPassword = p.getString("ap", "");
   wifiPassword = p.getString("wifi", ""); String passcode = p.getString("passcode", "");
+  githubToken = p.getString("github", "");
   bool credentialOK = true;
   if (apPassword.length() < 8) { apPassword = randomHex(6); credentialOK &= p.putString("ap", apPassword) == apPassword.length(); }
   p.end();
-  if (!credentialOK) { Serial.println("FATAL: Cannot store credentials. No HID will start."); for (;;) delay(1000); }
+  if (!credentialOK) fatalStartup("FATAL: Cannot store credentials. No HID will start.");
   apName = "SteeringSW-" + String(uint32_t(ESP.getEfuseMac() >> 24) & 0xFFFFFF, HEX);
   webCsrf = randomHex(24);
   Serial.println("Steering Switch / 115200 baud. HELP for serial commands.");
   printSetupInfo();
-  beginHid(); runtime.begin(c, passcode);
+  beginHid();
+  if (!runtime.begin(c, passcode)) fatalStartup("FATAL: Cannot start input task.");
   runtime.log(restored ? "保存設定を復元しました" : "参考プリセットで開始。校正後に送信を有効にしてください");
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) { wifiAssociated = true; wifiFailureReason = 0; }
@@ -394,6 +447,17 @@ void loop() {
   }
   if (setupButton.update(millis(), digitalRead(0) == LOW)) {
     startAP();
+  }
+  if (verifyFirmware && millis() - firmwareBootAt >= 2500) {
+    if (apStarted && WiFi.AP.started() && runtime.hasSamples() && confirmFirmwareBoot()) {
+      verifyFirmware = false;
+      runtime.log("更新後の起動確認が完了しました");
+    } else if (millis() - firmwareBootAt >= 15000) fatalStartup("FATAL: Updated firmware did not pass startup checks.");
+  }
+  if (firmwareRestartPending() && !rebootAt) rebootAt = millis() + 1400;
+  if (otaOutputPaused && !firmwareInstalling()) {
+    otaOutputPaused = false;
+    applyInputMode(inputModePaused);
   }
   if (rebootAt && int32_t(millis() - rebootAt) >= 0) ESP.restart();
   delay(2);

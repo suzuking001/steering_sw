@@ -10,6 +10,8 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 |---|---|---|
 | GET | `/api/session` | CSRFトークン取得。ログイン不要 |
 | GET | `/api/status` | 入力値、認識状態、学習状態、ログ、BLE・Wi-Fi状態 |
+| POST | `/api/firmware/check` | GitHub Releasesの確認を開始。状態は `/api/status` の `firmware` で取得 |
+| POST | `/api/firmware/install` | `{"version":"1.0.1"}`。確認済みの版を取得・検証し、再起動する処理を開始 |
 | GET | `/api/config` | 現在の公開設定JSON |
 | PUT | `/api/config` | 設定JSONを検証・保存・適用 |
 | POST | `/api/validate` | 設定JSONを検証・正規化。保存しない |
@@ -29,6 +31,8 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 | POST | `/api/reboot` | 本体再起動 |
 
 正常応答は200、形式・設定のエラーは400、Host・CSRFは403、操作不能は409、サイズ超過は413、保存失敗は507です。エラー応答は `{"error":"説明"}` です。
+
+ファームウェア更新の開始応答は202です。状態には固定の更新元 `repository`、現在版 `version`、配布版 `availableVersion`、進捗 `received` と `size`（バイト）、`stage`、`message`、初回起動検証中の `bootChecking`、トークン登録状態の `tokenSet` を含みます。トークンの値はAPIに含めません。
 
 設定保存・復元APIからSSIDを変更することはできません。現在のSSIDを使用し、接続先は `/api/wifi` で変更します。WebのJSON読み込みは現在のSSIDを維持し、出力をOFFにした状態で検証してから編集画面へ反映します。確認して「保存・適用」を押すまでは保存されません。
 

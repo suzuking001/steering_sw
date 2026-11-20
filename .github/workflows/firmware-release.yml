@@ -1,0 +1,33 @@
+name: Publish ESP32 firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Verify release version
+        run: test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build and test
+        run: |
+          python -m pip install platformio==6.2.0
+          pio run -e esp32dev
+          scripts/test_native.sh
+          cp .pio/build/esp32dev/firmware.bin steering-sw-esp32dev.bin
+          test "$(wc -c < steering-sw-esp32dev.bin)" -le $((0x180000))
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" steering-sw-esp32dev.bin --verify-tag --generate-notes

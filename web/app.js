@@ -5,6 +5,7 @@ let config, saved, csrf = '', dirty = false, currentStatus, activeTab = 'buttons
 let histories = [[], []], learningButton = null, polling = false, lastReadingAt = 0;
 let saving = false;
 let wifiDirty = false, passcodeDirty = false, wifiSaving = false, passcodeSaving = false;
+let firmwareRequest = false, firmwareTarget = '';
 const isTouchEditor = navigator.maxTouchPoints > 0;
 const inputModeClient = Array.from(crypto.getRandomValues(new Uint8Array(8)),
   byte => byte.toString(16).padStart(2, '0')).join('');
@@ -375,6 +376,57 @@ function wifiStatus(s) {
   $('passcode').placeholder=s.passcodeSet?'登録済み（変更するときだけ入力）':'4〜12桁の数字';
   if(!passcodeDirty&&!passcodeSaving) feedback('passcode-feedback',s.passcodeSet?'パスコードは保存済みです。':'パスコードはまだ登録されていません。',s.passcodeSet?'good':'');
 }
+function renderFirmware(s) {
+  const firmware = s?.firmware;
+  if (!firmware) return;
+  const {version, availableVersion, stage, received, size, bootChecking} = firmware;
+  const updating = ['downloading','verifying','restarting'].includes(stage);
+  const ready = s.wifiConnected && !bootChecking && !updating && stage!=='checking' && !firmwareRequest;
+  $('firmware-repository').textContent = firmware.repository || '—';
+  $('firmware-version').textContent = version;
+  $('firmware-available').hidden = !availableVersion;
+  $('firmware-available').textContent = availableVersion ? '配布バージョン '+availableVersion : '';
+  $('firmware-check').disabled = !ready;
+  $('firmware-install').hidden = stage!=='available';
+  $('firmware-install').disabled = !ready;
+  $('firmware-progress').hidden = !updating || !size;
+  $('firmware-progress').value = size ? Math.floor(Math.min(received, size)*100/size) : 0;
+
+  let message = firmware.message;
+  let kind = stage==='failed' ? 'error' : '';
+  if (bootChecking) message = '更新後の起動を確認しています…';
+  else if (firmwareTarget && stage==='idle') {
+    message = version===firmwareTarget ? '更新が完了しました。新しい画面を表示するにはページを再読み込みしてください。' :
+      '更新後に再接続しました。現在のバージョンを確認して、必要に応じて再試行してください。';
+    kind = version===firmwareTarget ? 'good' : 'error';
+  } else if (!s.wifiConnected && !updating) message = '本体をインターネットに接続できるWi-Fiにつないでください。';
+  else if (!message) message = 'GitHub Releasesから更新できます。';
+  if ($('firmware-status').textContent!==message) feedback('firmware-status',message,kind);
+}
+
+async function requestFirmwareUpdate(version) {
+  if (firmwareRequest) return;
+  const requestFeedback = $('firmware-request-feedback');
+  requestFeedback.hidden = true;
+  if (version && hasChanges()) {
+    requestFeedback.textContent = '未保存の変更を保存または破棄してから、更新してください。';
+    requestFeedback.hidden = false;
+    return;
+  }
+  firmwareRequest = true;
+  firmwareTarget = version || '';
+  renderFirmware(currentStatus);
+  try {
+    await api(version ? 'firmware/install' : 'firmware/check', 'POST', version ? {version} : undefined);
+    await poll();
+  } catch (error) {
+    requestFeedback.textContent = error.message;
+    requestFeedback.hidden = false;
+  } finally {
+    firmwareRequest = false;
+    renderFirmware(currentStatus);
+  }
+}
 async function saveWifi() {
   if(wifiSaving) throw new Error('Wi-Fi設定を保存中です。');
   const ssid=$('wifi-ssid').value, password=$('wifi-password').value, open=$('wifi-open-network').checked;
@@ -534,6 +586,7 @@ async function poll() {
     }
     $('network-status').textContent=(s.wifiConnected?'Wi-Fi '+s.ip+' / '+s.rssi+' dBm':'既存Wi-Fi 未接続')+(s.apActive?' · 設定用AP '+s.apName+' / '+s.apIp:'')+' · 稼働 '+Math.floor(s.uptimeMs/1000)+'秒 · 空きRAM '+Math.round(s.freeHeap/1024)+'KB';
     wifiStatus(s);
+    renderFirmware(s);
     $('learn-status').textContent=s.learning.active?'学習中：キー送信を停止しています。残り '+(s.learning.remainingMs/1000).toFixed(1)+'秒':s.busy?'マクロ送信中':'入力監視中';
     $('logs').replaceChildren(...s.logs.slice().reverse().map(log=>el('li',{},el('time',{},(log.at/1000).toFixed(1)+'s'),log.message)));
     renderLearning();
@@ -649,6 +702,8 @@ $('show-passcode').addEventListener('change',()=>{$('passcode').type=$('show-pas
 $('wifi-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{note((await saveWifi()).message);await poll();});});
 $('passcode-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{note((await savePasscode()).message);await poll();});});
 $('wifi-reconnect').addEventListener('click',()=>run(async()=>{note((await api('wifi/reconnect','POST')).message);await poll();}));
+$('firmware-check').addEventListener('click',()=>requestFirmwareUpdate());
+$('firmware-install').addEventListener('click',()=>requestFirmwareUpdate(currentStatus?.firmware?.availableVersion));
 $('copy-lan-url').addEventListener('click',()=>run(async()=>{
   const text=$('wifi-lan-url').textContent;
   if(navigator.clipboard?.writeText){try{await navigator.clipboard.writeText(text);note('PC用URLをコピーしました。');return;}catch{}}

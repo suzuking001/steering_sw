@@ -2,8 +2,13 @@
 Import("env")
 from pathlib import Path
 import gzip
+import re
 
 root = Path(env.subst("$PROJECT_DIR"))
+version = (root / "VERSION").read_text().strip()
+if not re.fullmatch(r"(?:0|[1-9][0-9]{0,3})(?:\.(?:0|[1-9][0-9]{0,3})){2}", version):
+    raise ValueError("VERSION must contain major.minor.patch, with up to four digits per component")
+env.Append(CPPDEFINES=[("SW_FIRMWARE_VERSION", env.StringifyMacro(version))])
 out_dir = Path(env.subst("$BUILD_DIR")) / "generated"
 out_dir.mkdir(parents=True, exist_ok=True)
 parts = ["#pragma once\n#include <Arduino.h>\n"]

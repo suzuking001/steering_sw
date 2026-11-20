@@ -4,6 +4,7 @@
 #include "connection.h"
 #include "access.h"
 #include "network_state.h"
+#include "ota_release.h"
 #include <iostream>
 #include <stdexcept>
 #include <limits>
@@ -16,6 +17,19 @@ void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(m
 void test(const char* name, const std::function<void()>& fn) {
   try { fn(); ++passed; std::cout << "PASS " << name << '\n'; }
   catch (const std::exception& e) { std::cerr << "FAIL " << name << ": " << e.what() << '\n'; std::exit(1); }
+}
+JsonDocument releaseFixture() {
+  JsonDocument doc;
+  doc["tag_name"] = "v1.10.0";
+  doc["draft"] = false;
+  doc["prerelease"] = false;
+  auto asset = doc["assets"].to<JsonArray>().add<JsonObject>();
+  asset["name"] = kFirmwareAsset;
+  asset["state"] = "uploaded";
+  asset["id"] = uint64_t{4294967300};
+  asset["size"] = 1540000;
+  asset["digest"] = "sha256:" + std::string(64, 'a');
+  return doc;
 }
 struct Harness {
   Config cfg = defaults(); GestureEngine engine;
@@ -68,6 +82,40 @@ int main(int argc,char** argv) {
   test("setup button triggers once at three seconds and rearms on release",[]{SetupButton b;b.update(0,false);b.update(10,true);require(!b.update(3009,true),"early trigger");require(b.update(3010,true),"missing trigger");require(!b.update(9000,true),"repeated trigger");b.update(9010,false);b.update(9020,true);require(b.update(12020,true),"did not rearm");});
   test("setup button short press does not open Wi-Fi",[]{SetupButton b;b.update(0,false);b.update(10,true);require(!b.update(2000,true),"short trigger");b.update(2010,false);b.update(2500,true);require(!b.update(4500,true),"short presses combined");});
   test("setup button duration handles millis wrap",[]{SetupButton b;b.update(UINT32_MAX-100,false);b.update(UINT32_MAX-50,true);require(!b.update(100,true),"wrap early");require(b.update(3000,true),"wrap missed");});
+  test("OTA selects a newer stable release using numeric version ordering",[]{
+    auto doc = releaseFixture(); FirmwareRelease release;
+    const auto view = doc.as<JsonVariantConst>();
+    require(readFirmwareRelease(view,"1.9.9",0x180000,release)==ReleaseResult::Available,"newer release rejected");
+    require(std::string_view(release.version)=="1.10.0" && release.assetId==4294967300 && release.digest[31]==0xaa,"bad asset data");
+    require(readFirmwareRelease(view,"1.10.0",0x180000,release)==ReleaseResult::Current,"same version offered");
+    require(readFirmwareRelease(view,"2.0.0",0x180000,release)==ReleaseResult::Current,"downgrade offered");
+  });
+  test("OTA rejects unofficial versions, wrong assets, oversized binaries and bad digests",[]{
+    FirmwareRelease release;
+    for (const char* tag : {"v1.0.1-rc1", "v1.01.1", "v1.0.1.9", "1.0.1"}) {
+      auto doc = releaseFixture(); doc["tag_name"] = tag;
+      require(readFirmwareRelease(doc.as<JsonVariantConst>(),"1.0.0",0x180000,release)==ReleaseResult::Invalid,"malformed tag accepted");
+    }
+    auto doc = releaseFixture();
+    require(readFirmwareRelease(doc.as<JsonVariantConst>(),"1.0.0",0x170000,release)==ReleaseResult::TooLarge,"oversized binary accepted");
+    doc["prerelease"] = true;
+    require(readFirmwareRelease(doc.as<JsonVariantConst>(),"1.0.0",0x180000,release)==ReleaseResult::Invalid,"prerelease accepted");
+    doc["prerelease"] = false;
+    doc["assets"][0]["name"] = "bootloader.bin";
+    require(readFirmwareRelease(doc.as<JsonVariantConst>(),"1.0.0",0x180000,release)==ReleaseResult::Invalid,"wrong asset accepted");
+    doc["assets"][0]["name"] = kFirmwareAsset;
+    doc["assets"][0]["digest"] = "sha256:" + std::string(64, 'z');
+    require(readFirmwareRelease(doc.as<JsonVariantConst>(),"1.0.0",0x180000,release)==ReleaseResult::Invalid,"invalid SHA-256 accepted");
+  });
+  test("OTA only accepts HTTPS redirects to known GitHub asset hosts",[]{
+    require(isGithubAssetRedirect("https://release-assets.githubusercontent.com/asset?id=123"),"valid asset redirect rejected");
+    for (const char* url : {"http://release-assets.githubusercontent.com/a", "https://release-assets.githubusercontent.com@elsewhere.test/a",
+                            "https://release-assets.githubusercontent.com.elsewhere.test/a", "https://elsewhere.test/a", "https://release-assets.githubusercontent.com/a#fragment"}) {
+      require(!isGithubAssetRedirect(url),"unsafe redirect accepted");
+    }
+    require(isGithubToken("github_pat_fixture123") && !isGithubToken("ghp_fixture123") && !isGithubToken("github_pat_abc\r\n"),
+            "token format validation failed");
+  });
   test("reference preset is valid and output is disabled",[]{auto c=defaults();require(validate(c).empty(),"invalid defaults");require(!c.outputEnabled,"unexpected output");require(c.buttons.size()==9,"button count");});
   test("JSON round trip preserves configuration",[]{auto c=defaults();c.name="別の車";c.channels[0].pullup=470;JsonDocument d;toJson(c,d.to<JsonObject>());Config out;std::string err;require(fromJson(d.as<JsonVariantConst>(),out,err),err.c_str());require(out.name==c.name&&out.channels[0].pullup==470,"lost fields");});
   test("legacy input units and thresholds survive loading",[]{

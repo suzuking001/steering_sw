@@ -37,7 +37,8 @@ class Runtime {
   void logLocked(const String& message);
   bool actionLocked(const std::string& action, Gesture gesture, bool physical, String& error);
  public:
-  void begin(const Config& cfg, const String& passcode);
+  bool begin(const Config& cfg, const String& passcode);
+  bool hasSamples();
   Config config();
   void apply(const Config& cfg);
   void setPasscode(const String& passcode);
