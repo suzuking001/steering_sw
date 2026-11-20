@@ -1,0 +1,677 @@
+'use strict';
+const $ = id => document.getElementById(id);
+const clone = obj => JSON.parse(JSON.stringify(obj));
+let config, saved, csrf = '', dirty = false, currentStatus, activeTab = 'buttons';
+let histories = [[], []], learningButton = null, polling = false, lastReadingAt = 0;
+let saving = false;
+let wifiDirty = false, passcodeDirty = false, wifiSaving = false, passcodeSaving = false;
+const isTouchEditor = navigator.maxTouchPoints > 0;
+const inputModeClient = Array.from(crypto.getRandomValues(new Uint8Array(8)),
+  byte => byte.toString(16).padStart(2, '0')).join('');
+let inputModeRequested = false, inputModeRequest = false, inputModeDesired = false;
+let focusTimer, inputModeHeartbeat;
+const keyboardFields = ['wifi-ssid', 'wifi-password', 'passcode', 'button-name-input'];
+let keyboardField, keyboardTimer, keyboardLayout;
+let messageTimer;
+const builtins = [['none','未割り当て'],['volume_up','音量＋（押し続けで連続）'],['volume_down','音量－（押し続けで連続）'],['play_pause','再生／一時停止'],['mute','消音'],['next','次の曲'],['previous','前の曲'],['home','ホーム'],['switch_app','アプリ切り替え'],['maps','Googleマップ'],['youtube','YouTube'],['siri','Siri'],['lock','画面ロック'],['app_list','アプリ一覧'],['passcode','パスコード送信（長押し専用）']];
+const presetIds = ['maps','youtube','siri','lock','app_list'];
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key,value] of Object.entries(attrs)) {
+    if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+    else if (key === 'class') node.className = value;
+    else if (key === 'checked' || key === 'disabled') node[key] = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) if (child !== null && child !== undefined) node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  return node;
+}
+function note(message, error = false) {
+  const node = $('message'); node.textContent = message; node.className = error ? 'error' : ''; node.hidden = false;
+  clearTimeout(messageTimer); messageTimer = setTimeout(() => { node.hidden = true; }, error ? 14000 : 7000);
+}
+function hasChanges() { return dirty || wifiDirty || passcodeDirty; }
+function refreshDirty() {
+  const parts = [dirty?'本体設定':null, wifiDirty?'Wi-Fi':null, passcodeDirty?'端末パスコード':null].filter(Boolean);
+  $('dirty-state').textContent = parts.length ? '未保存：'+parts.join('・') : '保存済み';
+  $('save').disabled = saving || !parts.length;
+}
+function setDirty() { dirty = true; refreshDirty(); }
+function markSaved() { dirty = false; refreshDirty(); }
+function feedback(id, message, kind = '') {
+  $(id).textContent = message; $(id).className = 'form-feedback '+kind;
+}
+function field(label, obj, key, type = 'number', attrs = {}) {
+  const input = el('input', {type, ...attrs});
+  if (type === 'checkbox') input.checked = !!obj[key]; else input.value = obj[key];
+  input.addEventListener(type === 'checkbox' ? 'change' : 'input', () => {
+    obj[key] = type === 'checkbox' ? input.checked : type === 'number' ? input.valueAsNumber : input.value; setDirty();
+  });
+  return el('label', {class: type === 'checkbox' ? 'check' : ''}, ...(type === 'checkbox' ? [input,label] : [label,input]));
+}
+function selectField(label, values, value, onChange) {
+  const select = el('select');
+  for (const [id,name] of values) select.append(el('option', {value:id},name));
+  select.value = String(value); select.addEventListener('change', () => onChange(select.value));
+  return el('label', {},label,select);
+}
+async function api(path, method = 'GET', data, retryToken = true) {
+  const options = {method, credentials:'same-origin', cache:'no-store', headers:{}};
+  if (path === 'ble/input-mode' && data?.enabled === false) options.keepalive = true;
+  const controller = new AbortController(); options.signal = controller.signal;
+  const timeout = setTimeout(()=>controller.abort(), method==='GET'?4000:10000);
+  if (method !== 'GET') options.headers['X-CSRF-Token'] = csrf;
+  if (data !== undefined) { options.headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(data); }
+  let response, result;
+  try { response = await fetch('/api/' + path, options); result = await response.json(); }
+  catch(error) { throw new Error(error.name==='AbortError'?'本体の応答を待ちきれませんでした。入力は残っています。Wi-Fiの接続先を確認してください。':'本体と通信できません。入力は残っています。接続先を確認して再試行してください。'); }
+  finally { clearTimeout(timeout); }
+  if(response.status===403 && method!=='GET' && retryToken) {
+    csrf=(await api('session')).csrf;
+    return api(path,method,data,false);
+  }
+  if (!response.ok) {
+    const error = new Error(result.error || '通信に失敗しました');
+    error.status = response.status; throw error;
+  }
+  return result;
+}
+async function connectWorkspace() {
+  $('opening').hidden = false; $('retry-connection').hidden = true;
+  try { csrf = (await api('session')).csrf; await openWorkspace(); }
+  catch(error) {
+    csrf = ''; $('workspace').hidden = true; $('opening').hidden = false;
+    $('opening-message').textContent = '本体へ接続できません。Wi-Fiの接続先を確認し、もう一度接続してください。';
+    $('retry-connection').hidden = false;
+  }
+}
+async function openWorkspace() {
+  config = await api('config'); saved = clone(config); histories = [[],[]];
+  wifiDirty = passcodeDirty = false;
+  $('wifi-password').value=''; $('passcode').value='';
+  $('show-wifi-password').checked=$('show-passcode').checked=false;
+  $('wifi-password').type=$('passcode').type='password';
+  learningButton = null; markSaved(); renderAll();
+  $('message').hidden = true;
+  $('opening').hidden = true; $('workspace').hidden = false;
+  checkInputFocus();
+  await poll();
+}
+function renderAll() {
+  $('device-name').textContent = config.name;
+  if(!wifiDirty) $('wifi-ssid').value = config.ssid;
+  renderLive(); renderInputs(); renderButtons(); renderMacros(); renderSettings();
+}
+function renderLive() {
+  $('live-cards').replaceChildren(...config.channels.map((ch,i) => el('section',{class:'panel'},
+    el('div',{class:'card-heading'},el('h3',{},channelName(i)),el('span',{class:'badge'},'GPIO ' + [36,39][i])),
+    el('div',{id:'reading-button-'+i,class:'read-button'},'—'),
+    el('div',{class:'metrics'},...['ADC','mV','Ω（推定）'].map((name,j) => el('div',{class:'metric'},el('strong',{id:'metric-'+i+'-'+j},'—'),el('small',{},name)))),
+    el('canvas',{id:'chart-'+i,'aria-label':channelName(i)+'の電圧 (mV)',role:'img'}),
+    el('p',{id:'reading-detail-'+i,class:'muted'},'測定待ち'))));
+}
+const channelUnit = mode => ({adc:'ADC', mv:'mV', ohm:'Ω'}[mode]);
+function channelName(index) {
+  const key = 'KEY' + (index + 1);
+  const name = config.channels[index].name.trim();
+  return name && name !== key ? key + ' · ' + name : key;
+}
+function measuredValue(channel, reading) {
+  if (channel.mode === 'mv') return reading.mv;
+  if (channel.mode === 'adc') return reading.adc;
+  if (reading.adc >= 4090 || reading.mv >= channel.supplyMv - 20) return null;
+  return channel.pullup * reading.mv / (channel.supplyMv - reading.mv);
+}
+function hasFreshReading() {
+  const samples = currentStatus?.samples;
+  return Number.isFinite(samples) && samples > 0 && performance.now() - lastReadingAt < 1500;
+}
+function setIdleFromReading(index, input) {
+  const reading = currentStatus?.readings?.[index];
+  if (!reading || !hasFreshReading()) {
+    note('最新の測定値がありません。本体との接続を確認してから、もう一度押してください。', true);
+    return;
+  }
+  const channel = config.channels[index];
+  const value = measuredValue(channel, reading);
+  if (!Number.isFinite(value)) {
+    note(channelName(index)+'の現在値を選択中の判定単位で測定できません。', true);
+    return;
+  }
+  channel.idleCenter = Number(value.toFixed(1));
+  input.value = channel.idleCenter;
+  setDirty();
+  note(channelName(index)+'の未押下の中心値に '+channel.idleCenter+' '+channelUnit(channel.mode)+' を設定しました。');
+}
+function renderInputs() {
+  $('input-cards').replaceChildren(...config.channels.map((channel, index) => {
+    const idleCenter = field('未押下の中心値', channel, 'idleCenter', 'number', {min:0,step:'any'});
+    const setIdle = el('button', {type:'button',class:'secondary',
+      onclick:()=>setIdleFromReading(index,idleCenter.querySelector('input'))}, '現在値を設定する');
+    const fields = el('div', {class:'fields'},
+      field('系統名', channel, 'name', 'text', {maxlength:24}),
+      selectField('判定単位', [['adc','ADC値'], ['mv','電圧 mV'], ['ohm','推定抵抗値 Ω']], channel.mode, value => {
+        if (confirm('単位を変更すると、その系統の未押下範囲とボタンの中心値を測り直す必要があります。')) {
+          channel.mode = value;
+          config.outputEnabled = false;
+          channel.idleCenter = null;
+          for (const button of config.buttons.filter(button=>button.channel===index)) button.center = null;
+          setDirty();
+          renderButtons();
+          renderSettings();
+        }
+        renderInputs();
+      }),
+      field('プルアップ抵抗 Ω', channel, 'pullup', 'number', {min:10,max:1000000,step:'any'}),
+      field('供給電圧 mV', channel, 'supplyMv', 'number', {min:1000,max:3600,step:'any'}),
+      el('div',{class:'field-with-action wide'},idleCenter,setIdle),
+      field('未押下の許容幅 ±', channel, 'idleTolerance', 'number', {min:0.1,step:'any'}),
+      field('ヒステリシス', channel, 'hysteresis', 'number', {min:0,step:'any'}));
+    return el('section', {class:'panel'}, el('h3', {}, channelName(index)), fields);
+  }));
+}
+function openLearning(button) {
+  learningButton = button;
+  $('learn-title').textContent = button.name + 'の学習';
+  $('learn-feedback').textContent = 'キー送信を一時停止しています…';
+  $('learn-cards').replaceChildren(...config.channels.map((_,index) => {
+    const capture = el('button',{type:'button',id:'capture-'+index,disabled:true,
+      onclick:()=>captureReading(index)}, '現在値を設定する');
+    return el('section',{class:'learn-card'},el('h3',{},channelName(index)),
+      el('strong',{id:'learn-mv-'+index,class:'learn-voltage'},'— mV'),
+      el('p',{id:'learn-value-'+index,class:'muted'},'測定待ち'),capture);
+  }));
+  $('learn-dialog').showModal();
+  checkInputFocus();
+  renderLearning();
+}
+function renderLearning() {
+  if (!learningButton || !$('learn-dialog').open) return;
+  const ready = currentStatus?.bleSuspended && hasFreshReading();
+  for (let i=0; i<config.channels.length; i++) {
+    const channel = config.channels[i], reading = currentStatus?.readings[i];
+    const value = reading ? measuredValue(channel, reading) : null;
+    $('learn-mv-'+i).textContent = Number.isFinite(reading?.mv) ? Math.round(reading.mv) + ' mV' : '— mV';
+    $('learn-value-'+i).textContent = '判定値 ' + (Number.isFinite(value) ? Number(value.toFixed(1))+' '+channelUnit(channel.mode) : '—');
+    const full = !channelHasSpace(i, learningButton);
+    const capture = $('capture-'+i);
+    capture.disabled = !ready || !Number.isFinite(value) || full;
+    capture.textContent = full ? '登録上限（16個）' : '現在値を設定する';
+  }
+  $('learn-feedback').textContent = ready ? '取り込んだ値と入力系統はカードに反映されます。' :
+    '測定値とキー送信の停止を確認しています…';
+}
+function captureReading(index) {
+  if (!learningButton || $('capture-'+index).disabled || !hasFreshReading()) return;
+  const channel = config.channels[index];
+  const value = Number(measuredValue(channel, currentStatus.readings[index]).toFixed(1));
+  const button = learningButton;
+  button.channel = index;
+  button.center = value;
+  setDirty();
+  $('learn-dialog').close();
+  renderButtons();
+  document.querySelector('[data-button-id="'+button.id+'"] .learn-button').focus();
+}
+function channelHasSpace(channel, except) {
+  return config.buttons.filter(button=>button !== except && button.channel===channel).length < 16;
+}
+function actionOptions(isLong) {
+  return [...builtins.filter(([id])=>isLong || id!=='passcode'),...config.macros.map(m=>['macro:'+m.id,'マクロ：'+m.name])];
+}
+async function testAction(action) {
+  const macroId = action.startsWith('macro:') ? action.slice(6) : action;
+  if (action.startsWith('macro:') || presetIds.includes(action)) {
+    const draft = config.macros.find(macro => macro.id === macroId);
+    const applied = saved.macros.find(macro => macro.id === macroId);
+    if (JSON.stringify(draft?.steps) !== JSON.stringify(applied?.steps)) {
+      throw new Error('マクロの変更を保存・適用してからテストしてください。');
+    }
+  }
+  const result = await api('test', 'POST', {action});
+  note(result.message);
+}
+function renderButtons() {
+  const openDetails = new Set([...document.querySelectorAll('#button-cards details[open]')].map(detail=>detail.closest('[data-button-id]').dataset.buttonId));
+  $('button-cards').replaceChildren(...config.buttons.map(button => {
+    const labels = config.channels.map((channel,index)=>[index, channelName(index)]);
+    const unit = channelUnit(config.channels[button.channel].mode);
+    const title = el('h3', {}, button.name);
+    const nameField = field('ボタン名', button, 'name', 'text', {maxlength:32});
+    nameField.querySelector('input').addEventListener('input', () => { title.textContent = button.name; });
+    const channelField = selectField('入力系統',labels,button.channel,value=>{
+      const next = Number(value);
+      if (config.channels[button.channel].mode !== config.channels[next].mode) button.center = null;
+      button.channel = next;
+      setDirty(); renderButtons();
+    });
+    for (const option of channelField.querySelectorAll('option')) {
+      option.disabled = !channelHasSpace(Number(option.value), button);
+    }
+    const actions = el('div',{class:'button-actions'});
+    for (const [key,label] of [['shortAction','短押し'],['doubleAction','ダブルクリック'],['longAction','長押し']]) {
+      const selected = button[key];
+      const unavailable = key !== 'shortAction' && ['volume_up','volume_down'].includes(button.shortAction);
+      const action = selectField(label,actionOptions(key==='longAction'),selected,value=>{
+        button[key]=value;
+        if (key==='shortAction' && ['volume_up','volume_down'].includes(value)) button.doubleAction=button.longAction='none';
+        setDirty(); renderButtons();
+      });
+      action.querySelector('select').disabled = unavailable;
+      const test = el('button', {type:'button',class:'secondary',
+        disabled: unavailable || selected==='none' || selected==='passcode',
+        'aria-label':label+'をテスト', onclick:()=>run(()=>testAction(selected))}, 'テスト');
+      actions.append(el('div',{class:'field-with-action'},action,test));
+    }
+    const summary = el('span');
+    const updateSummary = () => {
+      const learned = Number.isFinite(button.center);
+      summary.className = 'badge ' + (learned?'good':'warn');
+      summary.textContent = learned ? channelName(button.channel)+' · '+button.center+' '+unit : '未学習';
+    };
+    updateSummary();
+    const center = field('中心値',button,'center','number',{min:0,step:'any'});
+    center.querySelector('input').addEventListener('input',updateSummary);
+    const detail = el('details',{},el('summary',{},'入力系統・中心値・許容幅'),el('div',{class:'fields'},
+      channelField, center,
+      field('許容幅 ±',button,'tolerance','number',{min:0.1,step:'any'}),
+      el('p',{class:'muted wide'},'単位 '+unit)));
+    detail.open = openDetails.has(button.id);
+    return el('section',{class:'button-card','data-button-id':button.id},
+      el('div',{class:'card-heading'},title,
+        el('button',{type:'button',class:'quiet',onclick:()=>{
+          if (!confirm(button.name+'を削除しますか？')) return;
+          config.buttons=config.buttons.filter(item=>item!==button);setDirty();renderButtons();
+        }},'削除')),
+      nameField,
+      el('div',{class:'button-learn-row'},summary,
+        el('button',{type:'button',class:'learn-button',onclick:()=>openLearning(button)},'学習')),
+      actions, detail);
+  }));
+}
+function renderMacros() {
+  $('macro-cards').replaceChildren(...config.macros.map(m=>{
+    const card = el('section',{class:'macro-card'});
+    const title = el('div',{class:'card-heading'},el('h3',{},m.name),el('span',{class:'badge'},m.id));
+    if (!presetIds.includes(m.id)) title.append(el('button',{class:'quiet',onclick:()=>{
+      if(!confirm('このマクロを削除しますか？参照中のボタンは未割り当てになります。'))return;
+      config.macros=config.macros.filter(x=>x!==m);
+      for(const b of config.buttons)for(const key of ['shortAction','doubleAction','longAction'])if(b[key]==='macro:'+m.id)b[key]='none';
+      setDirty();renderMacros();renderButtons();
+    }},'削除'));
+    card.append(title,field('マクロ名',m,'name','text',{maxlength:32}));
+    m.steps.forEach((s,index)=>{
+      const fields=el('div',{class:'fields'},selectField('操作',[['chord','キー／ショートカット'],['media','メディアキー'],['text','文字列'],['wait','待機']],s.type,value=>{
+        m.steps[index]={type:value,...(value==='chord'?{key:30,modifiers:0}:value==='media'?{usage:205}:value==='text'?{text:'sample'}:{ms:500})};setDirty();renderMacros();
+      }));
+      if(s.type==='chord') {
+        fields.append(field('HIDキー番号（10進数）',s,'key','number',{min:4,max:115,step:1}));
+        const modifiers=el('div',{class:'modifiers'});
+        for(const [bit,label] of [[1,'Control'],[2,'Shift'],[4,'Option / Alt'],[8,'Command / GUI']]) {
+          const check=el('input',{type:'checkbox',checked:!!(s.modifiers&bit),onchange:event=>{s.modifiers=event.target.checked?s.modifiers|bit:s.modifiers&~bit;setDirty();}});
+          modifiers.append(el('label',{class:'check'},check,label));
+        }
+        fields.append(modifiers);
+      }
+      if(s.type==='media')fields.append(selectField('メディア操作',[[233,'音量＋'],[234,'音量－'],[226,'消音'],[205,'再生／一時停止'],[181,'次の曲'],[182,'前の曲'],[183,'停止']],s.usage,value=>{s.usage=Number(value);setDirty();}));
+      if(s.type==='text') { const f=field('入力文字列（ASCII）',s,'text','text',{maxlength:128});f.classList.add('wide');fields.append(f); }
+      if(s.type==='wait')fields.append(field('待機時間 ms',s,'ms','number',{min:0,max:10000,step:1}));
+      const tools=el('div',{class:'step-toolbar'},el('button',{class:'secondary',disabled:index===0,onclick:()=>{[m.steps[index-1],m.steps[index]]=[m.steps[index],m.steps[index-1]];setDirty();renderMacros();}},'↑'),
+        el('button',{class:'secondary',disabled:index===m.steps.length-1,onclick:()=>{[m.steps[index+1],m.steps[index]]=[m.steps[index],m.steps[index+1]];setDirty();renderMacros();}},'↓'),
+        el('button',{class:'secondary',onclick:()=>{m.steps.splice(index,1);setDirty();renderMacros();}},'削除'));
+      card.append(el('div',{class:'step'},fields,tools));
+    });
+    card.append(el('div',{class:'actions'},el('button',{class:'secondary',disabled:m.steps.length>=32,onclick:()=>{m.steps.push({type:'wait',ms:500});setDirty();renderMacros();}},'ステップ追加'),
+      el('button',{class:'secondary',onclick:()=>run(async()=>{
+        if(dirty)throw new Error('先に保存・適用してからテストしてください。');
+        await testAction('macro:'+m.id);
+      })},'保存済みマクロをテスト')));
+    return card;
+  }));
+}
+function renderSettings() {
+  const fields=$('general-fields');
+  fields.replaceChildren(field('設定名',config,'name','text',{maxlength:32}),field('キー送信を有効にする',config,'outputEnabled','checkbox'));
+  for(const [key,label,min,max] of [['debounceMs','安定判定 ms',5,250],['longMs','長押し ms',400,5000],['doubleMs','ダブルクリック間隔 ms',100,600],['repeatDelayMs','音量の連続開始 ms',200,3000],['repeatMs','音量の連続間隔 ms',50,1000],['wakeDelayMs','パスコード送信前の待機 ms',0,10000]])fields.append(field(label,config.timing,key,'number',{min,max,step:1}));
+  fields.append(field('パスコード前にSpaceで起床する',config.timing,'wakeSpace','checkbox'));
+  $('acc-fields').replaceChildren(field('ACC連動を有効にする',config.acc,'enabled','checkbox'),
+    field('OFFしきい値 mV',config.acc,'thresholdMv','number',{min:100,max:3000,step:1}),field('OFF安定判定 ms',config.acc,'debounceMs','number',{min:100,max:10000,step:1}));
+}
+function drawChart(i) {
+  const canvas=$('chart-'+i);if(!canvas||activeTab!=='settings')return;
+  const rect=canvas.getBoundingClientRect();if(!rect.width)return;
+  const ratio=window.devicePixelRatio||1,width=rect.width,height=170;
+  canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);
+  const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);
+  const data=histories[i];
+  const max=Math.max(3300, ...data.filter(Number.isFinite));
+  const left=43,top=12,bottom=height-22,right=width-10;
+  const y=value=>bottom-value/max*(bottom-top);
+  ctx.font='10px sans-serif';ctx.textAlign='right';
+  for(let t=0;t<=4;t++){const val=max*t/4;ctx.strokeStyle='#dfe9ef';ctx.beginPath();ctx.moveTo(left,y(val));ctx.lineTo(right,y(val));ctx.stroke();ctx.fillStyle='#607788';ctx.fillText(Math.round(val).toLocaleString(),left-5,y(val)+4);}
+  ctx.strokeStyle='#137d83';ctx.lineWidth=2;ctx.beginPath();let drawing=false;
+  data.forEach((value,n)=>{if(value===null){drawing=false;return;}const x=left+(n+150-data.length)/149*(right-left);if(!drawing)ctx.moveTo(x,y(value));else ctx.lineTo(x,y(value));drawing=true;});ctx.stroke();
+  ctx.fillStyle='#607788';ctx.textAlign='left';ctx.fillText('−30秒',left,height-5);ctx.textAlign='right';ctx.fillText('現在 · mV',right,height-5);
+}
+function wifiStatus(s) {
+  const ssid=s.wifiSavedSsid ?? saved.ssid;
+  const configured=s.wifiConfigured ?? !!ssid;
+  $('wifi-saved-state').textContent=configured?'保存済み：'+ssid+(s.wifiPasswordSet?'（パスワード登録済み）':'（パスワードなし）'):'Wi-Fi接続先：未設定';
+  $('wifi-saved-state').className='save-state '+(configured?'good':'');
+  const state=s.wifiState || (s.wifiConnected?'connected':configured?'connecting':'unconfigured');
+  const descriptions={unconfigured:'ルーターへの接続先は未設定です。設定用Wi-Fiで操作できます。',connecting:'保存済みのWi-Fiへ接続中です…',getting_ip:'Wi-Fiに接続しました。IPアドレスを取得中です…',connected:'接続成功：'+(s.wifiConnectedSsid||ssid),failed:'接続できていません。設定は保存されています。'+(s.wifiError||'SSID・パスワード・電波の状態を確認してください。')};
+  $('wifi-connection-state').textContent=descriptions[state]||'接続を確認しています…';
+  $('wifi-connection-state').className='connection-state '+(state==='connected'?'good':state==='failed'?'error':'');
+  $('wifi-reconnect').disabled=!configured||wifiSaving;
+  const url=s.wifiLanUrl || (s.wifiConnected&&s.ip&&s.ip!=='0.0.0.0'?'http://'+s.ip+'/':'');
+  $('wifi-lan-access').hidden=!url;
+  if(url){$('wifi-lan-url').textContent=url;$('wifi-lan-url').href=url;$('wifi-lan-detail').textContent='PCを「'+(s.wifiConnectedSsid||ssid)+'」と同じネットワークにつなぎ、このURLをブラウザーで開いてください。'+(s.mdnsReady?' http://steering-sw.local/ も利用できます。':'');}
+  if(!wifiDirty&&!wifiSaving){
+    $('wifi-open-network').checked=configured&&!s.wifiPasswordSet;
+    $('wifi-password').placeholder=s.wifiPasswordSet?'登録済み（変更しない場合は入力不要）':'Wi-Fiパスワードを入力';
+  }
+  if(!wifiDirty&&!wifiSaving) feedback('wifi-feedback',configured?'保存済みの設定です。接続結果は上の表示をご確認ください。':'Wi-Fi設定を入力し、保存してください。',configured?'good':'');
+  $('passcode-state').textContent=s.passcodeSet?'パスコード：登録済み':'パスコード：未登録';
+  $('passcode').placeholder=s.passcodeSet?'登録済み（変更するときだけ入力）':'4〜12桁の数字';
+  if(!passcodeDirty&&!passcodeSaving) feedback('passcode-feedback',s.passcodeSet?'パスコードは保存済みです。':'パスコードはまだ登録されていません。',s.passcodeSet?'good':'');
+}
+async function saveWifi() {
+  if(wifiSaving) throw new Error('Wi-Fi設定を保存中です。');
+  const ssid=$('wifi-ssid').value, password=$('wifi-password').value, open=$('wifi-open-network').checked;
+  if(open&&password) throw new Error('パスワードを入力した場合は「パスワードなし」のチェックを外してください。');
+  const payload={ssid};if(password||open||!ssid)payload.password=open||!ssid?'':password;
+  wifiSaving=true;$('save-wifi').disabled=true;
+  feedback('wifi-feedback','保存しています…');
+  try{
+    const result=await api('wifi','PUT',payload);
+    config.ssid=saved.ssid=ssid;
+    wifiDirty=$('wifi-ssid').value!==ssid||$('wifi-password').value!==password||$('wifi-open-network').checked!==open;
+    refreshDirty();feedback('wifi-feedback',wifiDirty?'送信した設定は保存済みです。その後の入力変更は未保存です。':'Wi-Fi設定を保存しました。接続成功かどうかは上の接続状態をご確認ください。','good');
+    return result;
+  }catch(error){feedback('wifi-feedback','保存を確認できませんでした：'+error.message,'error');throw error;}
+  finally{wifiSaving=false;$('save-wifi').disabled=false;}
+}
+async function savePasscode() {
+  if(passcodeSaving)throw new Error('パスコードを保存中です。');
+  const passcode=$('passcode').value;
+  if(!/^[0-9]{4,12}$/.test(passcode))throw new Error('パスコードは4〜12桁の半角数字を入力してください。');
+  passcodeSaving=true;$('save-passcode').disabled=true;feedback('passcode-feedback','保存しています…');
+  try{
+    const result=await api('passcode','PUT',{passcode});
+    passcodeDirty=$('passcode').value!==passcode;refreshDirty();
+    feedback('passcode-feedback',passcodeDirty?'送信したパスコードは保存済みです。その後の入力は未保存です。':'パスコードを保存しました。入力した内容はこのページに残しています。','good');
+    return result;
+  }catch(error){feedback('passcode-feedback','保存を確認できませんでした：'+error.message,'error');throw error;}
+  finally{passcodeSaving=false;$('save-passcode').disabled=false;}
+}
+function renderInputMode() {
+  const help = $('input-mode-help');
+  let message = '';
+  if (isTouchEditor && inputModeDesired && !$('learn-dialog').open) {
+    message = currentStatus?.bleSuspended && !currentStatus.bleConnected ?
+      '文字入力中はESP32とのBluetooth接続を一時停止しています。' :
+      '文字入力のためBluetoothを一時停止しています…';
+  }
+  if (help.textContent !== message) help.textContent = message;
+  help.hidden = !message;
+}
+async function syncInputMode() {
+  if (inputModeRequest || !csrf || (!inputModeDesired && !inputModeRequested)) return;
+  const enabled = inputModeDesired;
+  inputModeRequest = true;
+  // A lost response can still mean that the device received the pause.
+  if (enabled) inputModeRequested = true;
+  try {
+    await api('ble/input-mode', 'PUT', {enabled, client:inputModeClient});
+    inputModeRequested = enabled;
+  } catch (error) {
+    if (enabled && inputModeDesired) note(error.message, true);
+    // The device expires its pause even if the resume request is lost.
+  } finally {
+    inputModeRequest = false;
+    if (inputModeDesired !== enabled) syncInputMode();
+  }
+}
+function setInputFocus(focused) {
+  if (inputModeDesired === focused) return;
+  inputModeDesired = focused;
+  clearInterval(inputModeHeartbeat);
+  if (focused) inputModeHeartbeat = setInterval(syncInputMode, 4000);
+  renderInputMode();
+  syncInputMode();
+}
+function checkInputFocus() {
+  const active = document.activeElement;
+  const field = $('field-keyboard').contains(active) ? keyboardField : active;
+  const editable = field?.matches('#workspace input:is([type="text"], [type="password"], [type="number"], :not([type])), #workspace textarea') &&
+    !field.disabled && !field.readOnly && !field.closest('[hidden]');
+  const focused = isTouchEditor && !document.hidden && editable ? field : null;
+  updateFieldKeyboard(focused && keyboardFields.includes(focused.id) ? focused : null);
+  setInputFocus(!document.hidden && (!!focused || $('learn-dialog').open));
+}
+function updateFieldKeyboard(field) {
+  if (keyboardField === field) return;
+  clearTimeout(keyboardTimer);
+  keyboardField = field;
+  $('field-keyboard').hidden = true;
+  if (!field) return;
+  keyboardLayout = field.id === 'passcode' ? 'number' : 'lower';
+  field.closest('label').after($('field-keyboard'));
+  renderFieldKeyboard();
+  // Safari can report the software keyboard's viewport change after an animation.
+  keyboardTimer = setTimeout(() => {
+    keyboardTimer = undefined;
+    showFieldKeyboard();
+  }, 450);
+}
+function showFieldKeyboard() {
+  if (!keyboardField || keyboardTimer !== undefined) return;
+  const viewport = window.visualViewport;
+  const nativeVisible = viewport && viewport.scale <= 1.1 &&
+    document.documentElement.clientHeight - viewport.height > 140;
+  const panel = $('field-keyboard');
+  if (nativeVisible || document.hidden) {
+    panel.hidden = true;
+  } else if (panel.hidden) {
+    panel.hidden = false;
+    panel.scrollIntoView({block:'nearest'});
+  }
+}
+function renderFieldKeyboard() {
+  const rows = {
+    number: ['123', '456', '789', '0'],
+    lower: ['1234567890', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm'],
+    upper: ['1234567890', 'QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM'],
+    symbols: ["!@#$%^&*()", "-_=+[]{}", "|\\;:'\"<>`", ",.?/~"]
+  };
+  const key = (label, action, special = false) => el('button', {
+    type:'button', class:special?'secondary':'', onclick:action
+  }, label);
+  const panel = $('field-keyboard');
+  const tools = el('div', {class:'field-keyboard-row'});
+  if (keyboardLayout !== 'number') {
+    const changeLayout = (layout, label) => key(label, () => {
+      keyboardLayout = layout;
+      renderFieldKeyboard();
+    }, true);
+    tools.append(changeLayout('lower', 'abc'), changeLayout('upper', 'ABC'),
+      changeLayout('symbols', '記号'), key('空白', () => typeFieldKey(' '), true));
+  }
+  tools.append(key('削除', () => typeFieldKey(''), true), key('完了', () => {
+    keyboardField?.blur();
+    if (panel.contains(document.activeElement)) document.activeElement.blur();
+    checkInputFocus();
+  }, true));
+  panel.replaceChildren(...rows[keyboardLayout].map(row => el('div', {class:'field-keyboard-row'},
+    ...Array.from(row, letter => key(letter, () => typeFieldKey(letter))))), tools);
+}
+function typeFieldKey(letter) {
+  const field = keyboardField;
+  if (!field) return;
+  let start = field.selectionStart ?? field.value.length;
+  const end = field.selectionEnd ?? start;
+  if (letter && field.value.length - (end - start) + letter.length > field.maxLength) return;
+  if (!letter && start === end) {
+    start -= Array.from(field.value.slice(0, start)).at(-1)?.length ?? 0;
+  }
+  field.setRangeText(letter, start, end, 'end');
+  field.dispatchEvent(new Event('input', {bubbles:true}));
+}
+async function poll() {
+  if(!csrf||polling)return;polling=true;
+  try {
+    const s=await api('status');currentStatus=s;lastReadingAt=performance.now();
+    $('connection').textContent=s.bleSuspended?'BLE 一時停止':s.bleReady?'BLE 操作可能':s.bleConnected?'BLE 接続準備中':'BLE 未接続';
+    $('connection').className='badge '+(s.bleReady?'good':'warn');
+    renderInputMode();
+    $('output-state').textContent=s.outputEnabled?'キー送信 ON':'キー送信 OFF';$('output-state').className='badge '+(s.outputEnabled?'good':'warn');
+    for(let i=0;i<2;i++){
+      const r=s.readings[i];$('reading-button-'+i).textContent=r.button;
+      $('metric-'+i+'-0').textContent=Math.round(r.adc).toLocaleString();$('metric-'+i+'-1').textContent=Math.round(r.mv).toLocaleString();
+      $('metric-'+i+'-2').textContent=r.ohm===null?'測定不可':r.ohm.toLocaleString(undefined,{maximumFractionDigits:1});
+      $('reading-detail-'+i).textContent='生ADC '+r.raw+' · 判定単位 '+channelUnit(r.mode)+' · 参考プリセットは実車で校正してください';
+      histories[i].push(r.mv);if(histories[i].length>150)histories[i].shift();drawChart(i);
+    }
+    $('network-status').textContent=(s.wifiConnected?'Wi-Fi '+s.ip+' / '+s.rssi+' dBm':'既存Wi-Fi 未接続')+(s.apActive?' · 設定用AP '+s.apName+' / '+s.apIp:'')+' · 稼働 '+Math.floor(s.uptimeMs/1000)+'秒 · 空きRAM '+Math.round(s.freeHeap/1024)+'KB';
+    wifiStatus(s);
+    $('learn-status').textContent=s.learning.active?'学習中：キー送信を停止しています。残り '+(s.learning.remainingMs/1000).toFixed(1)+'秒':s.busy?'マクロ送信中':'入力監視中';
+    $('logs').replaceChildren(...s.logs.slice().reverse().map(log=>el('li',{},el('time',{},(log.at/1000).toFixed(1)+'s'),log.message)));
+    renderLearning();
+  }catch(error){if(csrf){$('connection').textContent='本体との通信待ち';$('connection').className='badge warn';$('wifi-connection-state').textContent='本体との通信を待っています。Wi-Fiの接続先を確認してください。';$('wifi-connection-state').className='connection-state error';}}
+  finally{polling=false; renderLearning();}
+}
+async function run(fn) { try{await fn();}catch(error){note(error.message,true);} }
+function validateLocal() {
+  for(const ch of config.channels)for(const key of ['pullup','supplyMv','idleCenter','idleTolerance','hysteresis'])if(!Number.isFinite(ch[key]))throw new Error('入力設定の数値を入力してください。');
+  for(const b of config.buttons)if(!Number.isFinite(b.center)||!Number.isFinite(b.tolerance))throw new Error(b.name+'の中心値・許容幅を入力するか、学習してください。');
+}
+$('retry-connection').addEventListener('click',connectWorkspace);
+if (isTouchEditor) {
+  $('field-keyboard').addEventListener('pointerdown', event => event.preventDefault());
+  $('field-keyboard').addEventListener('mousedown', event => event.preventDefault());
+  window.visualViewport?.addEventListener('resize', showFieldKeyboard);
+  document.addEventListener('focusin', () => {
+    clearTimeout(focusTimer);
+    checkInputFocus();
+  });
+  document.addEventListener('focusout', () => {
+    clearTimeout(focusTimer);
+    // A tap on another field can blur the old field before the new one gains focus.
+    focusTimer = setTimeout(checkInputFocus, 250);
+  });
+}
+document.addEventListener('visibilitychange', checkInputFocus);
+window.addEventListener('pagehide', () => {
+  clearTimeout(focusTimer);
+  updateFieldKeyboard(null);
+  setInputFocus(false);
+});
+window.addEventListener('pageshow', checkInputFocus);
+$('close-learn').addEventListener('click',()=> $('learn-dialog').close());
+$('learn-dialog').addEventListener('close',()=>{
+  learningButton = null;
+  checkInputFocus();
+});
+for(const button of document.querySelectorAll('nav button'))button.addEventListener('click',()=>{activeTab=button.dataset.tab;for(const b of document.querySelectorAll('nav button'))b.classList.toggle('selected',b===button);for(const section of document.querySelectorAll('[id^="tab-"]'))section.hidden=section.id!=='tab-'+activeTab;for(let i=0;i<2;i++)drawChart(i);});
+$('save').addEventListener('click',()=>run(async()=>{
+  if (saving) return;
+  if(currentStatus?.learning.active)throw new Error('学習完了後に保存してください。');
+  saving = true;
+  refreshDirty();
+  try {
+    if (dirty) {
+      validateLocal();
+      const submitted = clone(config);
+      await api('config','PUT',submitted);
+      saved = submitted;
+      if (JSON.stringify(config) === JSON.stringify(submitted)) {
+        markSaved();
+        if (!$('learn-dialog').open && !$('button-name-dialog').open) renderAll();
+      } else {
+        setDirty();
+      }
+    }
+    // Wi-Fi goes last because it can change the current network connection.
+    if(passcodeDirty)await savePasscode();
+    if(wifiDirty)await saveWifi();
+    note(hasChanges() ? '送信済みの設定を保存しました。その後の変更は未保存です。' : '変更した設定を保存しました。Wi-Fiの接続結果は本体設定で確認できます。');
+  } finally {
+    saving = false;
+    refreshDirty();
+  }
+  await poll();
+}));
+$('discard').addEventListener('click',()=>{
+  if(hasChanges()&&!confirm('未保存の変更を破棄しますか？'))return;
+  config=clone(saved);wifiDirty=passcodeDirty=false;$('wifi-password').value=$('passcode').value='';
+  learningButton=null;$('message').hidden=true;markSaved();renderAll();if(currentStatus)wifiStatus(currentStatus);
+});
+$('stop').addEventListener('click',()=>run(async()=>{note((await api('stop','POST')).message);}));
+$('add-button').addEventListener('click',()=>{
+  if (![0,1].some(channel=>channelHasSpace(channel))) {
+    note('各系統16個まで登録できます。',true);
+    return;
+  }
+  let number = 1;
+  const names = new Set(config.buttons.map(button=>button.name.trim().normalize('NFKC')));
+  while (names.has('ボタン'+number)) number++;
+  $('button-name-input').value = 'ボタン'+number;
+  $('button-name-input').setCustomValidity('');
+  $('button-name-dialog').showModal();
+  $('button-name-input').select();
+});
+$('cancel-button-name').addEventListener('click',()=> $('button-name-dialog').close());
+$('button-name-input').addEventListener('input',event=>event.target.setCustomValidity(''));
+$('button-name-form').addEventListener('submit',event=>{
+  event.preventDefault();
+  const input = $('button-name-input');
+  const name = input.value.trim();
+  if (!name || config.buttons.some(button=>button.name.trim().normalize('NFKC')===name.normalize('NFKC'))) {
+    input.setCustomValidity(name ? 'ほかのボタンと異なる名前を入力してください。' : 'ボタン名を入力してください。');
+    input.reportValidity();
+    return;
+  }
+  const channel = [0,1].find(index=>channelHasSpace(index));
+  if (channel===undefined) return;
+  const button = {id:'b'+Date.now().toString(36)+Math.random().toString(36).slice(2,6),
+    name,channel,center:null,tolerance:10,shortAction:'none',doubleAction:'none',longAction:'none'};
+  config.buttons.push(button);
+  $('button-name-dialog').close();
+  setDirty(); renderButtons();
+  document.querySelector('[data-button-id="'+button.id+'"] .learn-button').focus();
+});
+$('add-macro').addEventListener('click',()=>{if(config.macros.length>=16){note('マクロは16個まで登録できます。',true);return;}config.macros.push({id:'m'+Date.now().toString(36),name:'新しいマクロ',steps:[{type:'wait',ms:500}]});setDirty();renderMacros();renderButtons();});
+function touchWifi(){wifiDirty=true;refreshDirty();feedback('wifi-feedback','入力中：まだ保存していません。');}
+for(const id of ['wifi-ssid','wifi-password','wifi-open-network'])for(const event of ['input','change'])$(id).addEventListener(event,touchWifi);
+for(const event of ['input','change'])$('passcode').addEventListener(event,()=>{passcodeDirty=!!$('passcode').value;refreshDirty();feedback('passcode-feedback',passcodeDirty?'入力中：まだ保存していません。':'空欄では保存済みパスコードを変更しません。');});
+$('show-wifi-password').addEventListener('change',()=>{$('wifi-password').type=$('show-wifi-password').checked?'text':'password';});
+$('show-passcode').addEventListener('change',()=>{$('passcode').type=$('show-passcode').checked?'text':'password';});
+$('wifi-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{note((await saveWifi()).message);await poll();});});
+$('passcode-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{note((await savePasscode()).message);await poll();});});
+$('wifi-reconnect').addEventListener('click',()=>run(async()=>{note((await api('wifi/reconnect','POST')).message);await poll();}));
+$('copy-lan-url').addEventListener('click',()=>run(async()=>{
+  const text=$('wifi-lan-url').textContent;
+  if(navigator.clipboard?.writeText){try{await navigator.clipboard.writeText(text);note('PC用URLをコピーしました。');return;}catch{}}
+  const range=document.createRange();range.selectNodeContents($('wifi-lan-url'));const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+  note('URLを選択しました。長押しまたはCtrl+Cでコピーしてください。');
+}));
+$('delete-passcode').addEventListener('click',()=>run(async()=>{
+  if(!confirm('保存済みパスコードを削除しますか？'))return;
+  const result=await api('passcode','PUT',{passcode:''});$('passcode').value='';passcodeDirty=false;refreshDirty();note(result.message);await poll();
+}));
+$('backup').addEventListener('click',()=>run(async()=>{const data=await api('backup');const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const link=el('a',{href:url,download:'steering-config-'+new Date().toISOString().slice(0,10)+'.json'});document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);note('保存済み設定をダウンロードしました。秘密情報は含まれません。');}));
+$('restore-file').addEventListener('change',event=>run(async()=>{
+  const file=event.target.files[0];event.target.value='';if(!file)return;if(file.size>24576)throw new Error('JSONは24KB以内にしてください。');
+  if(hasChanges()&&!confirm('編集中の内容を置き換えますか？'))return;
+  const data=JSON.parse(await file.text());if(data.version!==1||!Array.isArray(data.channels)||data.channels.length!==2||!Array.isArray(data.buttons)||data.buttons.length>32||!Array.isArray(data.macros)||data.macros.length>16||!data.timing||!data.acc)throw new Error('設定JSONの形式が不正です。');
+  data.ssid=saved.ssid;data.outputEnabled=false;
+  config=await api('validate','POST',data);learningButton=null;setDirty();renderAll();note('JSONを編集画面へ読み込みました。安全のため送信はOFFに変更しました。確認後に保存してください。');
+}));
+$('load-defaults').addEventListener('click',()=>run(async()=>{if(!confirm('編集内容を参考プリセットに置き換えますか？まだ本体には保存しません。'))return;config=await api('defaults');learningButton=null;setDirty();renderAll();note('旧資料の参考プリセットを読み込みました。実車の値で校正してください。');}));
+$('reboot').addEventListener('click',()=>run(async()=>{if(confirm('本体を再起動しますか？未保存の変更は失われます。'))note((await api('reboot','POST')).message);}));
+$('forget-ble').addEventListener('click',()=>run(async()=>{if(confirm('BLEペアリング情報を削除して再起動しますか？接続先の端末側でもデバイス登録を解除してください。'))note((await api('ble/forget','POST')).message);}));
+$('reset').addEventListener('click',()=>run(async()=>{if(!confirm('入力・Wi-Fi・端末パスコードを初期化しますか？設定用APのパスワードとBLEペアリングは維持します。'))return;const result=await api('reset','POST',{confirm:'RESET'});note(result.message);await openWorkspace();}));
+window.addEventListener('beforeunload',event=>{if(hasChanges()){event.preventDefault();event.returnValue='';}});
+window.addEventListener('resize',()=>{for(let i=0;i<2;i++)drawChart(i);});
+setInterval(poll,200);
+connectWorkspace();

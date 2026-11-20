@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#142c3a">
+<title>Steering Switch｜ステアリングスイッチ設定</title>
+<link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script>
+</head>
+<body>
+<header><div><p class="eyebrow">ESP32 · BLUETOOTH CONTROLLER</p><h1>Steering Switch</h1><p class="subtitle">ステアリングスイッチから端末を操作。</p></div><span class="badge" id="connection">未接続</span></header>
+<main>
+<section id="opening" class="panel login"><h2>設定画面を開いています…</h2><p id="opening-message">Wi-Fiに接続した端末から、そのまま設定できます。Webのパスワードは不要です。</p><button id="retry-connection" class="secondary" hidden>もう一度接続する</button></section>
+<details class="panel" id="connection-guide"><summary>かんたん接続ガイド · 普段はBluetoothだけ</summary>
+<p><strong>普段の操作：</strong>ESP32に電源を入れ、接続先の端末の「設定 → Bluetooth」で「Steering Switch」を最初に一度登録します。次回からは再接続して使います。Wi-Fiは設定を変更するときだけ使います。</p>
+<ol><li><strong>設定用Wi-Fiを開く：</strong>設定用Wi-FiはESP32の電源投入時に起動します。見つからないときは起動後にBOOTボタンを3秒押してください。</li><li><strong>端末を接続する：</strong>スマートフォンやタブレットのWi-Fi設定で「SteeringSW-」から始まる名前を選び、初回に控えたパスワードを入力します。</li><li><strong>設定画面を開く：</strong>自動表示された画面で、そのまま設定できます。表示されない場合はブラウザーで <a href="http://192.168.4.1/">http://192.168.4.1/</a> を開きます。Webのパスワード入力は不要です。</li></ol>
+<p>「インターネット未接続」と表示されても、設定用Wi-Fiとして使用できます。設定が終わったら普段のWi-Fiへ戻してください。</p>
+<p class="muted">接続先の端末の画面ロック解除用パスコードは別のものです。タッチ端末で入力欄を選ぶとBluetoothを一時停止し、入力欄から離れると再接続します。</p>
+</details>
+<div id="workspace" hidden>
+<div class="toolbar"><span id="device-name"></span><span id="output-state" class="badge"></span><button id="stop" class="secondary">実行中の送信を中止</button></div>
+<p id="input-mode-help" class="input-mode-help" role="status" hidden></p>
+<nav aria-label="設定カテゴリー"><button data-tab="buttons" class="selected">ボタン割当</button><button data-tab="macros">マクロ</button><button data-tab="settings">本体設定</button></nav>
+<section id="tab-buttons">
+  <div class="section-heading">
+    <div><h2>ボタン割当</h2><p>カードの「学習」でスイッチを押したときの値を登録できます。</p></div>
+    <button id="add-button" type="button">ボタンを追加</button>
+  </div>
+  <div id="button-cards" class="button-grid"></div>
+</section>
+<section id="tab-macros" hidden><div class="section-heading"><div><h2>マクロ</h2><p>キー・メディア操作・文字列・待ち時間を順番に送信します。文字列は半角英数とASCII記号に対応します。</p></div><button id="add-macro">マクロを追加</button></div><details class="panel"><summary>専用ショートカットとキー番号</summary><p>対応端末の「ショートカット」でGoogleマップ／YouTubeを開く操作を作成し、「設定 → アクセシビリティ → キーボード → フルキーボードアクセス → コマンド」からキーを割り当てます。</p><p>初期値はControl＋Option＋Shift＋数字です。1：Googleマップ、2：YouTube、3：Siri、4：ロック、5：アプリ一覧。実際のコマンド名は端末のOSにより異なります。</p><p>キー番号はUSB HID Usage IDの10進数です。A=4、H=11、Q=20、1=30、2=31、3=32、4=33、5=34、0=39、Enter=40、Backspace=42、Tab=43、Space=44、→=79、←=80。</p><p>端末の日本語／英語配列や入力モードで記号の入力結果は変わります。新しいマクロは停車中に送信テストしてください。</p></details><div id="macro-cards"></div></section>
+<section id="tab-settings" hidden><h2>本体と接続の設定</h2><section class="panel">
+  <h3>入力のライブモニター</h3>
+  <div id="live-cards" class="two-col"></div>
+  <details><summary>入力の詳細設定</summary><p class="muted">未押下の中心値を設定するときは、すべてのスイッチを離してください。</p><div id="input-cards" class="two-col"></div></details>
+  <details><summary>接続と操作ログ</summary><p id="network-status"></p><p id="learn-status" class="muted"></p><ol id="logs" class="logs"></ol></details>
+</section>
+<div class="two-col"><section class="panel"><h3>動作設定</h3><div id="general-fields" class="fields"></div><p class="muted">初回は校正を完了し、未押下で何も認識されないことを確認してからキー送信を有効にしてください。</p></section><section class="panel" id="wifi-panel"><h3>Wi-Fi接続</h3><p>ESP32を家庭・車内の2.4GHz Wi-Fiへ接続します。設定の保存と、Wi-Fiへの接続成功は別々に表示します。</p>
+<p id="wifi-saved-state" class="save-state">保存状態を確認しています…</p>
+<p id="wifi-connection-state" class="connection-state">接続状態を確認しています…</p>
+<div id="wifi-lan-access" class="lan-access" hidden><strong>同じネットワークのPCから開くURL</strong><a id="wifi-lan-url" href="/">—</a><button type="button" id="copy-lan-url" class="secondary">URLをコピー</button><p id="wifi-lan-detail" class="muted"></p></div>
+<p id="wifi-access-help" class="muted">ルーターへの接続に成功すると、ここにPC用URLが表示されます。192.168.4.1 はESP32の設定用Wi-Fiへ直接つないだときのアドレスです。</p>
+<form id="wifi-form" autocomplete="off"><label>SSID<input id="wifi-ssid" maxlength="32" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
+<label>Wi-Fiパスワード<input id="wifi-password" name="wifi-password" type="password" maxlength="63" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
+<label class="check"><input id="show-wifi-password" type="checkbox">入力したパスワードを表示</label>
+<label class="check"><input id="wifi-open-network" type="checkbox">パスワードなしのWi-Fiへ接続する</label>
+<div class="actions"><button id="save-wifi" type="submit">Wi-Fi設定を保存して接続</button><button id="wifi-reconnect" type="button" class="secondary">保存した設定で再接続</button></div></form>
+<p id="wifi-feedback" class="form-feedback" role="status">Wi-Fi設定を入力し、保存してください。</p>
+<p class="muted">保存後も入力内容は残ります。ページを開き直したときは、保存済みパスワードを表示せず、登録状態を表示します。同じSSIDのパスワードを変更しない場合は、パスワード欄を空にして保存できます。</p></section>
+<section class="panel"><h3>端末パスコード</h3><p id="passcode-state"></p><p>4〜12桁の数字を登録できます。実ボタンの長押しで1回送信し、再送まで10秒以上空けます。接続先の端末のロック状態は取得できません。</p><form id="passcode-form">
+<label>新しいパスコード<input id="passcode" type="password" inputmode="numeric" pattern="[0-9]{4,12}" minlength="4" maxlength="12" required autocomplete="off"></label><label class="check"><input id="show-passcode" type="checkbox">入力したパスコードを表示</label><button id="save-passcode" type="submit">登録・更新</button><button type="button" id="delete-passcode" class="secondary">削除</button></form><p id="passcode-feedback" class="form-feedback" role="status">保存状態を確認しています…</p><p class="muted">保存後も入力した値はこのページに残ります。再表示時は保存済みの内容を読み出さず、「登録済み」と表示します。NVSに保存し、バックアップには含めません。</p></section><section class="panel"><h3>ACC連動（オプション）</h3><p>保護済みのACC信号と、OFF後も送信できる電源保持回路を用意した場合に有効にします。GPIO34へ車両電源を直接つながないでください。</p><div id="acc-fields" class="fields"></div><p class="muted">旧資料の10kΩ／3.3kΩ分圧は使用しません。安定したONを一度検出してからOFFでロックを1回送ります。</p></section><section class="panel"><h3>バックアップとメンテナンス</h3><div class="actions vertical"><button id="backup" class="secondary">保存済み設定をJSONでダウンロード</button><label class="file-label">JSONを読み込んで編集<input id="restore-file" type="file" accept=".json,application/json"></label><button id="load-defaults" class="secondary">参考プリセットを編集画面へ読み込む</button><button id="reboot" class="secondary">本体を再起動</button><button id="forget-ble" class="secondary">BLEペアリングを削除して再起動</button><button id="reset" class="danger">入力・Wi-Fi・パスコードを初期化</button></div><p class="muted">JSONにWi-Fiパスワード・端末パスコードは含まれません。復元時は現在のWi-Fi接続を維持します。</p></section></div></section>
+<dialog id="button-name-dialog" aria-labelledby="button-name-title">
+  <form id="button-name-form" method="dialog">
+    <h2 id="button-name-title">ボタンを追加</h2>
+    <label>ボタン名<input id="button-name-input" type="text" maxlength="32" required></label>
+    <div class="dialog-actions">
+      <button type="button" class="secondary" id="cancel-button-name">キャンセル</button>
+      <button type="submit">追加</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="learn-dialog" aria-labelledby="learn-title">
+  <h2 id="learn-title">ボタンの学習</h2>
+  <p id="learn-instruction">登録したいスイッチを押したまま、反応した系統の「現在値を設定する」を押してください。</p>
+  <div id="learn-cards" class="two-col"></div>
+  <p id="learn-feedback" role="status" class="muted"></p>
+  <div class="dialog-actions"><button id="close-learn" type="button" class="secondary">閉じる</button></div>
+</dialog>
+<footer><span id="dirty-state">保存済み</span><div><button id="discard" class="secondary">変更を破棄</button><button id="save">保存・適用</button></div></footer>
+<div id="field-keyboard" class="field-keyboard" role="group" aria-label="画面キーボード" hidden></div>
+</div>
+<div id="message" role="status" aria-live="polite" hidden></div>
+</main>
+</body></html>
