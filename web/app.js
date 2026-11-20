@@ -573,6 +573,7 @@ async function poll() {
   if(!csrf||polling)return;polling=true;
   try {
     const s=await api('status');
+    $('stop').hidden = s.busy !== true;
     if (!s.readings && s.firmware) {
       currentStatus = {...currentStatus, firmware:s.firmware, wifiConnected:s.wifiConnected, bleSuspended:true, bleConnected:false, bleReady:false};
       $('connection').textContent='BLE 一時停止';
@@ -598,7 +599,7 @@ async function poll() {
     $('learn-status').textContent=s.learning.active?'学習中：キー送信を停止しています。残り '+(s.learning.remainingMs/1000).toFixed(1)+'秒':s.busy?'マクロ送信中':'入力監視中';
     $('logs').replaceChildren(...s.logs.slice().reverse().map(log=>el('li',{},el('time',{},(log.at/1000).toFixed(1)+'s'),log.message)));
     renderLearning();
-  }catch(error){if(csrf){$('connection').textContent='本体との通信待ち';$('connection').className='badge warn';$('wifi-connection-state').textContent='本体との通信を待っています。Wi-Fiの接続先を確認してください。';$('wifi-connection-state').className='connection-state error';}}
+  }catch(error){$('stop').hidden=true;if(csrf){$('connection').textContent='本体との通信待ち';$('connection').className='badge warn';$('wifi-connection-state').textContent='本体との通信を待っています。Wi-Fiの接続先を確認してください。';$('wifi-connection-state').className='connection-state error';}}
   finally{polling=false; renderLearning();}
 }
 async function run(fn) { try{await fn();}catch(error){note(error.message,true);} }
@@ -667,7 +668,7 @@ $('discard').addEventListener('click',()=>{
   config=clone(saved);wifiDirty=passcodeDirty=false;$('wifi-password').value=$('passcode').value='';
   learningButton=null;$('message').hidden=true;markSaved();renderAll();if(currentStatus)wifiStatus(currentStatus);
 });
-$('stop').addEventListener('click',()=>run(async()=>{note((await api('stop','POST')).message);}));
+$('stop').addEventListener('click',()=>run(async()=>{note((await api('stop','POST')).message);await poll();}));
 $('add-button').addEventListener('click',()=>{
   if (![0,1].some(channel=>channelHasSpace(channel))) {
     note('各系統16個まで登録できます。',true);
