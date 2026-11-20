@@ -34,6 +34,9 @@ const server=http.createServer(async(req,res)=>{
     if(req.method!=='GET'&&req.headers['x-csrf-token']!==fixtureCsrf){reply(403,{error:'CSRF'});return;}
     if(path==='session'){reply(200,{csrf:fixtureCsrf});return;}
     if(path==='status'){
+      if(['checking','downloading','verifying','restarting'].includes(firmware.stage)){
+        reply(200,{firmware,wifiConnected:wifiState==='connected'});return;
+      }
       const done=learning&&Date.now()-learningAt>400;
       reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:!bleSuspended,bleReady:!bleSuspended,bleSuspended,busy:false,passcodeSet,accMv:2000,
         readings:state.channels.map((c,i)=>({name:c.name,mode:c.mode,pin:[36,39][i],raw:3890,adc:3890,mv:i===0?3050:key2Millivolts,ohm:i===0?5211:5187,button:'未押下',buttonId:null})),
@@ -294,8 +297,8 @@ try{
   await wait('!document.getElementById("firmware-check").disabled');
   await evaluate(`document.getElementById('firmware-check').click()`);
   await wait('currentStatus.firmware.stage==="checking"');
-  check(!firmware.tokenSet && firmwareRequests.join(',')==='firmware/check' && await evaluate('document.getElementById("firmware-install").hidden'),
-    'checking for updates starts without a token and does not begin installation');
+  check(!firmware.tokenSet && firmwareRequests.join(',')==='firmware/check' && await evaluate('document.getElementById("firmware-install").hidden && document.getElementById("connection").textContent==="BLE 一時停止"'),
+    'checking without a token shows the temporary Bluetooth pause and does not begin installation');
   Object.assign(firmware,{stage:'failed',message:'公開リリースが見つかりません。更新元が非公開の場合はGitHubの認証が必要です。'});
   await wait('document.getElementById("firmware-status").textContent.includes("公開リリースが見つかりません")');
   check(await evaluate('!document.getElementById("firmware-check").disabled && document.getElementById("firmware-install").hidden'),

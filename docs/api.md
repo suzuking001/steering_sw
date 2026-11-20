@@ -34,6 +34,8 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 
 ファームウェア更新の開始応答は202です。状態には固定の更新元 `repository`、現在版 `version`、配布版 `availableVersion`、進捗 `received` と `size`（バイト）、`stage`、`message`、初回起動検証中の `bootChecking`、トークン登録状態の `tokenSet` を含みます。トークンの値はAPIに含めません。
 
+更新の確認・実行中、`/api/status` は進捗とWi-Fi接続状態のみを返します。この間はBluetoothと各種設定の更新を一時停止します。
+
 設定保存・復元APIからSSIDを変更することはできません。現在のSSIDを使用し、接続先は `/api/wifi` で変更します。WebのJSON読み込みは現在のSSIDを維持し、出力をOFFにした状態で検証してから編集画面へ反映します。確認して「保存・適用」を押すまでは保存されません。
 
 ## 設定JSON（version 1）

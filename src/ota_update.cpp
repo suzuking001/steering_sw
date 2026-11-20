@@ -48,6 +48,8 @@ bool isInstalling(Stage stage) {
   return stage == Stage::Downloading || stage == Stage::Verifying || stage == Stage::Restarting;
 }
 
+bool isBusy(Stage stage) { return stage == Stage::Checking || isInstalling(stage); }
+
 const esp_partition_t* updatePartition() {
   const auto* running = esp_ota_get_running_partition();
   const auto* target = esp_ota_get_next_update_partition(nullptr);
@@ -258,10 +260,12 @@ void firmwareWorker(void* arg) {
   vTaskDelete(nullptr);
 }
 
-bool launch(const String& token, bool install, const FirmwareRelease& release, const char*& error) {
+bool launch(const String& token, bool install, const FirmwareRelease& release, bool (*prepareNetwork)(), const char*& error) {
   if (install && release.authenticated && token.isEmpty()) { error = "非公開リリースにアクセスできません。更新を確認し直してください。"; return false; }
   if (WiFi.status() != WL_CONNECTED) { error = "本体をインターネットに接続できるWi-Fiにつないでください。"; return false; }
   if (!updatePartition()) { error = noPartition; return false; }
+  // Free the BLE host and controller buffers before TLS allocates its handshake workspace.
+  if (!prepareNetwork()) { error = "更新のためにBluetoothを一時停止できませんでした。"; return false; }
   auto* job = new (std::nothrow) Job{token, install, release};
   if (!job || job->token.length() != token.length()) {
     delete job;
@@ -277,19 +281,18 @@ bool launch(const String& token, bool install, const FirmwareRelease& release, c
 }
 }
 
-bool startFirmwareCheck(const String& token, const char*& error) {
-  const auto stage = statusSnapshot().stage;
-  if (stage == Stage::Checking || isInstalling(stage)) { error = "更新処理が実行中です。"; return false; }
-  return launch(token, false, {}, error);
+bool startFirmwareCheck(const String& token, bool (*prepareNetwork)(), const char*& error) {
+  if (firmwareBusy()) { error = "更新処理が実行中です。"; return false; }
+  return launch(token, false, {}, prepareNetwork, error);
 }
 
-bool startFirmwareInstall(const String& token, const String& version, const char*& error) {
+bool startFirmwareInstall(const String& token, const String& version, bool (*prepareNetwork)(), const char*& error) {
   const auto status = statusSnapshot();
   if (status.stage != Stage::Available || version != status.release.version) { error = "更新を確認し直してください。"; return false; }
-  return launch(token, true, status.release, error);
+  return launch(token, true, status.release, prepareNetwork, error);
 }
 
-bool firmwareInstalling() { return isInstalling(statusSnapshot().stage); }
+bool firmwareBusy() { return isBusy(statusSnapshot().stage); }
 bool firmwareRestartPending() { return statusSnapshot().stage == Stage::Restarting; }
 
 void firmwareStatus(JsonObject out) {

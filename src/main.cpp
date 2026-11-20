@@ -24,6 +24,7 @@ uint32_t inputModeUpdatedAt = 0;
 constexpr uint32_t inputModeTimeoutMs = 15000;
 uint32_t rebootAt = 0;
 uint32_t firmwareBootAt = 0;
+uint32_t lastHidResumeAt = 0;
 bool verifyFirmware = false, otaOutputPaused = false, inputModePaused = false;
 uint32_t lastApAttempt = 0;
 bool apStarted = false, mdnsStarted = false, wasConnected = false, networkChanged = false;
@@ -43,6 +44,13 @@ void applyInputMode(bool enabled) {
   setHidSuspended(enabled);
   runtime.log(!enabled ? "Bluetoothの再接続を待っています" :
               otaOutputPaused ? "更新のためBluetoothを一時停止しました" : "文字入力のためBluetoothを一時停止しました");
+}
+
+bool pauseHidForFirmware() {
+  if (otaOutputPaused) return true;
+  otaOutputPaused = runtime.stopHidForFirmware();
+  if (!otaOutputPaused) applyInputMode(inputModePaused);
+  return otaOutputPaused;
 }
 
 void printSetupInfo() {
@@ -94,8 +102,8 @@ bool allowRequest(bool write = false) {
   if (!checkAccess(canonical, write, tokenMatches)) {
     response(403, "設定画面を開き直してください"); return false;
   }
-  if (write && firmwareInstalling()) {
-    response(409, "ファームウェア更新中です。再起動後に操作してください");
+  if (write && (firmwareBusy() || otaOutputPaused)) {
+    response(409, "ファームウェアの処理中です。完了後にもう一度操作してください");
     return false;
   }
   return true;
@@ -199,10 +207,17 @@ void setupRoutes() {
   });
   server.on("/api/status", HTTP_GET, [] {
     if (!allowRequest()) { return; }
-    JsonDocument d; runtime.status(d.to<JsonObject>());
-    networkStatus(d.as<JsonObject>());
+    JsonDocument d;
     auto firmware = d["firmware"].to<JsonObject>();
     firmwareStatus(firmware); firmware["tokenSet"] = !githubToken.isEmpty(); firmware["bootChecking"] = verifyFirmware;
+    if (firmwareBusy()) {
+      // Leave heap available to TLS while the browser polls update progress.
+      d["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+      jsonResponse(d);
+      return;
+    }
+    runtime.status(d.as<JsonObject>());
+    networkStatus(d.as<JsonObject>());
     d["apActive"] = apStarted && WiFi.AP.started(); d["apName"] = apName;
     d["apIp"] = WiFi.softAPIP().toString(); d["freeHeap"] = ESP.getFreeHeap(); jsonResponse(d);
   });
@@ -210,7 +225,7 @@ void setupRoutes() {
     if (!allowRequest(true)) return;
     if (rebootAt || verifyFirmware) { response(409, "本体の起動確認が完了してから再試行してください"); return; }
     const char* error = nullptr;
-    if (!startFirmwareCheck(githubToken, error)) { response(409, error); return; }
+    if (!startFirmwareCheck(githubToken, pauseHidForFirmware, error)) { response(409, error); return; }
     response(202, "更新の確認を開始しました");
   });
   server.on("/api/firmware/install", HTTP_POST, [] {
@@ -219,9 +234,7 @@ void setupRoutes() {
     JsonDocument d; if (!body(d, 128)) return;
     if (!d["version"].is<const char*>()) { response(400, "更新するバージョンを指定してください"); return; }
     const char* error = nullptr;
-    if (!startFirmwareInstall(githubToken, d["version"].as<String>(), error)) { response(409, error); return; }
-    otaOutputPaused = true;
-    applyInputMode(inputModePaused);
+    if (!startFirmwareInstall(githubToken, d["version"].as<String>(), pauseHidForFirmware, error)) { response(409, error); return; }
     response(202, "ファームウェア更新を開始しました");
   });
   server.on("/api/config", HTTP_GET, [] {
@@ -383,7 +396,7 @@ void serialCommand() {
       }
       if (line.startsWith("GITHUB_TOKEN ") || line == "GITHUB_TOKEN_CLEAR") {
         String token = line == "GITHUB_TOKEN_CLEAR" ? String() : line.substring(13);
-        if (firmwareInstalling()) Serial.println("Firmware update in progress. Try after restart.");
+        if (firmwareBusy()) Serial.println("Firmware update in progress. Try after it completes.");
         else if (!token.isEmpty() && !isGithubToken({token.c_str(), token.length()})) Serial.println("Use a fine-grained GitHub personal access token.");
         else if (!saveSecret("github", token)) Serial.println("Could not save GitHub token.");
         else { githubToken = token; Serial.println(token.isEmpty() ? "GitHub token cleared." : "GitHub token registered."); }
@@ -420,7 +433,7 @@ void setup() {
   webCsrf = randomHex(24);
   Serial.println("Steering Switch / 115200 baud. HELP for serial commands.");
   printSetupInfo();
-  beginHid();
+  if (!beginHid()) fatalStartup("FATAL: Cannot start Bluetooth.");
   if (!runtime.begin(c, passcode)) fatalStartup("FATAL: Cannot start input task.");
   runtime.log(restored ? "保存設定を復元しました" : "参考プリセットで開始。校正後に送信を有効にしてください");
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -455,9 +468,12 @@ void loop() {
     } else if (millis() - firmwareBootAt >= 15000) fatalStartup("FATAL: Updated firmware did not pass startup checks.");
   }
   if (firmwareRestartPending() && !rebootAt) rebootAt = millis() + 1400;
-  if (otaOutputPaused && !firmwareInstalling()) {
-    otaOutputPaused = false;
-    applyInputMode(inputModePaused);
+  if (otaOutputPaused && !firmwareBusy() && millis() - lastHidResumeAt >= 1000) {
+    lastHidResumeAt = millis();
+    if (runtime.resumeHidAfterFirmware()) {
+      otaOutputPaused = false;
+      applyInputMode(inputModePaused);
+    }
   }
   if (rebootAt && int32_t(millis() - rebootAt) >= 0) ESP.restart();
   delay(2);

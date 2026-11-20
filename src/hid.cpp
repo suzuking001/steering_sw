@@ -44,25 +44,39 @@ uint8_t reportMap[] = {
   0x15,0x00,0x26,0xFF,0x03,0x19,0x00,0x2A,0xFF,0x03,0x75,0x10,0x95,0x01,0x81,0x00,0xC0
 };
 }
-void beginHid() {
-  NimBLEDevice::init("Steering Switch");
+bool beginHid() {
+  if (!NimBLEDevice::init("Steering Switch")) return false;
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   auto server = NimBLEDevice::createServer(); server->setCallbacks(&serverCallbacks, false);
-  auto hid = new NimBLEHIDDevice(server);
-  hid->setManufacturer("Steering Switch");
-  hid->setPnp(0x02, 0, 0, 0x0100);
-  hid->setHidInfo(0, 1);
-  hid->setBatteryLevel(100);
-  hid->setReportMap(reportMap, sizeof(reportMap));
-  keyboard = hid->getInputReport(1); media = hid->getInputReport(2);
-  hid->getOutputReport(1);
+  NimBLEHIDDevice hid(server);
+  hid.setManufacturer("Steering Switch");
+  hid.setPnp(0x02, 0, 0, 0x0100);
+  hid.setHidInfo(0, 1);
+  hid.setBatteryLevel(100);
+  hid.setReportMap(reportMap, sizeof(reportMap));
+  keyboard = hid.getInputReport(1); media = hid.getInputReport(2);
+  hid.getOutputReport(1);
   keyboard->setCallbacks(&keyCallbacks); media->setCallbacks(&mediaCallbacks);
   uint8_t zeros[8] = {}; keyboard->setValue(zeros, 8); media->setValue(zeros, 2);
   server->start();
   auto advertising = NimBLEDevice::getAdvertising();
-  advertising->setAppearance(HID_KEYBOARD); advertising->addServiceUUID(hid->getHidService()->getUUID());
-  advertising->setName("Steering Switch"); advertising->enableScanResponse(true); advertising->start();
+  advertising->setAppearance(HID_KEYBOARD); advertising->addServiceUUID(hid.getHidService()->getUUID());
+  advertising->setName("Steering Switch"); advertising->enableScanResponse(true);
+  if (!hidState.suspended) advertising->start();
+  return true;
+}
+bool stopHid() {
+  setHidSuspended(true);
+  if (!NimBLEDevice::deinit(true)) return false;
+  keyboard = nullptr;
+  media = nullptr;
+  hidState.connected = false;
+  hidState.encrypted = false;
+  hidState.keyboardSubscribed = false;
+  hidState.mediaSubscribed = false;
+  hidState.epoch.fetch_add(1);
+  return true;
 }
 bool hidReady() {
   return !hidState.suspended && hidState.connected && hidState.encrypted && hidState.keyboardSubscribed && hidState.mediaSubscribed;
@@ -70,6 +84,7 @@ bool hidReady() {
 void setHidSuspended(bool suspended) {
   if (hidState.suspended.exchange(suspended) == suspended) return;
   hidState.epoch.fetch_add(1);
+  if (!NimBLEDevice::isInitialized()) return;
   auto server = NimBLEDevice::getServer();
   if (suspended) {
     NimBLEDevice::stopAdvertising();

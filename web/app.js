@@ -572,7 +572,15 @@ function typeFieldKey(letter) {
 async function poll() {
   if(!csrf||polling)return;polling=true;
   try {
-    const s=await api('status');currentStatus=s;lastReadingAt=performance.now();
+    const s=await api('status');
+    if (!s.readings && s.firmware) {
+      currentStatus = {...currentStatus, firmware:s.firmware, wifiConnected:s.wifiConnected, bleSuspended:true, bleConnected:false, bleReady:false};
+      $('connection').textContent='BLE 一時停止';
+      $('connection').className='badge warn';
+      renderFirmware(currentStatus);
+      return;
+    }
+    currentStatus=s;lastReadingAt=performance.now();
     $('connection').textContent=s.bleSuspended?'BLE 一時停止':s.bleReady?'BLE 操作可能':s.bleConnected?'BLE 接続準備中':'BLE 未接続';
     $('connection').className='badge '+(s.bleReady?'good':'warn');
     renderInputMode();

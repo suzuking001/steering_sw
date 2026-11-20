@@ -31,6 +31,16 @@ bool Runtime::begin(const Config& cfg, const String& passcode) {
   return true;
 }
 bool Runtime::hasSamples() { Guard lock(mutex_); return samples_ != 0; }
+bool Runtime::stopHidForFirmware() {
+  Guard lock(mutex_);
+  runner_.cancel();
+  resetEngines();
+  return stopHid();
+}
+bool Runtime::resumeHidAfterFirmware() {
+  Guard lock(mutex_);
+  return beginHid();
+}
 void Runtime::resetEngines() {
   for (auto& engine : engines_) engine.reset();
   for (auto& r : readings_) r.recognized = kUnknown;

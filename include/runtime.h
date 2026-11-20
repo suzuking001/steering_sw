@@ -39,6 +39,8 @@ class Runtime {
  public:
   bool begin(const Config& cfg, const String& passcode);
   bool hasSamples();
+  bool stopHidForFirmware();
+  bool resumeHidAfterFirmware();
   Config config();
   void apply(const Config& cfg);
   void setPasscode(const String& passcode);

@@ -12,7 +12,8 @@ struct HidState {
   std::atomic<uint32_t> epoch{0};
 };
 extern HidState hidState;
-void beginHid();
+bool beginHid();
+bool stopHid();
 void setHidSuspended(bool suspended);
 bool hidReady();
 bool sendKey(uint8_t key, uint8_t modifiers);
