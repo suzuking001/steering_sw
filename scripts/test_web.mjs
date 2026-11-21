@@ -9,16 +9,19 @@ import {once} from 'node:events';
 import assert from 'node:assert/strict';
 const root=resolve(import.meta.dirname,'..'), binary=join(root,'.pio/native-tests/test_main');
 const fixture=()=>JSON.parse(execFileSync(binary,['--fixture'],{encoding:'utf8'}));
-let fixtureCsrf='fixture-csrf',bleSuspended=false,delayInputMode=false;
+let fixtureCsrf='fixture-csrf',inputModePaused=false,delayInputMode=false,delayInputResume=false;
+let pausedTestRequests=0;
 const inputModeRequests=[];
 let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,rejectNextPin=false;
 const savedWifiRequests=[],saveOrder=[];
 let state=fixture(),learning=null,learningAt=0,passcodeSet=false,testedActions=[];
 let macroBusy=false, stopRequests=0;
 let bleAttached=true, bleEncrypted=true, bleReconnectRequests=0;
+let bleKeyboard=true, bleMedia=true, bleProtocol='report', bleMapRead=false, bleDisconnectReason=0;
 let key2Millivolts=2750;
 const firmware={repository:'suzuking001/steering_sw',version:'1.0.1',availableVersion:'',stage:'idle',tokenSet:false,received:0,size:0,message:'',bootChecking:false};
 const firmwareRequests=[];
+const statusRequests=[];
 const errors=[];let checks=0;
 function check(condition,message){assert.ok(condition,message);checks++;console.log('PASS '+message);}
 const csp="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'";
@@ -32,20 +35,26 @@ const server=http.createServer(async(req,res)=>{
     }
     let raw='';for await(const part of req)raw+=part;
     const body=raw?JSON.parse(raw):{};
-    const path=req.url.slice(5);
+    const requestURL=new URL(req.url,'http://localhost');
+    const path=requestURL.pathname.slice(5);
     if(req.method!=='GET'&&req.headers['x-csrf-token']!==fixtureCsrf){reply(403,{error:'CSRF'});return;}
     if(path==='session'){reply(200,{csrf:fixtureCsrf});return;}
     if(path==='status'){
+      const includeLogs=requestURL.searchParams.get('logs')!=='0';
+      statusRequests.push(includeLogs);
       if(['checking','downloading','verifying','restarting'].includes(firmware.stage)){
         reply(200,{firmware,wifiConnected:wifiState==='connected'});return;
       }
       const done=learning&&Date.now()-learningAt>400;
-      const paused=bleSuspended||!state.ble.enabled, connected=bleAttached&&!paused;
-      const ble={...state.ble,advertising:!paused&&!connected,encrypted:connected&&bleEncrypted,keyboardReady:connected,mediaReady:connected&&bleEncrypted,bonds:1};
-      reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:connected&&bleEncrypted,bleSuspended:paused,ble,busy:macroBusy,passcodeSet,accMv:2000,
+      const paused=!state.ble.enabled, connected=bleAttached&&!paused;
+      const encrypted=connected&&bleEncrypted;
+      const ble={...state.ble,advertising:!paused&&!connected,encrypted,keyboardReady:encrypted&&bleKeyboard,mediaReady:encrypted&&bleMedia,
+        protocolMode:bleProtocol,reportMapRead:bleMapRead,disconnectReason:bleDisconnectReason,bonds:1,
+        advertisingIntervalMs:!paused&&!connected?20:undefined,automaticReconnects:1,serviceRefreshes:1,automaticRetryUsed:true};
+      reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:ble.keyboardReady||ble.mediaReady,bleSuspended:paused,inputModePaused,ble,busy:macroBusy,passcodeSet,accMv:2000,
         readings:state.channels.map((c,i)=>({name:c.name,mode:c.mode,pin:[36,39][i],raw:3890,adc:3890,mv:i===0?3050:key2Millivolts,ohm:i===0?5211:5187,button:'未押下',buttonId:null})),
         firmware,learning:{active:!!learning&&!done,done:!!done,channel:learning?.channel||0,count:400,error:'',remainingMs:done?0:200,center:3895,minimum:3890,maximum:3900,tolerance:15},
-        wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]});return;
+        wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:includeLogs?[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]:undefined});return;
     }
     if(path==='config'&&req.method==='GET'||path==='backup'){reply(200,state);return;}
     if(path==='defaults'){const data=fixture();data.ssid=state.ssid;reply(200,data);return;}
@@ -59,6 +68,7 @@ const server=http.createServer(async(req,res)=>{
     if(path==='learn/stop'){learning=null;reply(200,{message:'学習中止'});return;}
     if(path==='test'){
       if(body.action==='passcode'){reply(409,{error:'テストできない操作です'});return;}
+      if(inputModePaused){pausedTestRequests++;reply(409,{error:'キー送信が一時停止中です'});return;}
       testedActions.push(body.action);reply(200,{message:'テストを開始しました'});return;
     }
     if(path==='firmware/check'){
@@ -71,11 +81,13 @@ const server=http.createServer(async(req,res)=>{
     }
     if(path==='ble/input-mode'){
       inputModeRequests.push(body);
-      if(delayInputMode && body.enabled)await new Promise(resolve=>setTimeout(resolve,400));
-      bleSuspended=body.enabled;reply(200,{message:'文字入力の状態を更新しました'});return;
+      if(body.enabled?delayInputMode:delayInputResume)await new Promise(resolve=>setTimeout(resolve,400));
+      inputModePaused=body.enabled;
+      if(inputModePaused)macroBusy=false;
+      reply(200,{message:'文字入力の状態を更新しました'});return;
     }
     if(path==='ble/reconnect'){
-      if(!state.ble.enabled||bleSuspended){reply(409,{error:'Bluetoothを有効にしてください'});return;}
+      if(!state.ble.enabled){reply(409,{error:'Bluetoothを有効にしてください'});return;}
       bleReconnectRequests++;bleAttached=false;reply(200,{message:'Bluetoothの再接続を待っています'});return;
     }
     if(path==='passcode'){if(rejectNextPin){rejectNextPin=false;reply(507,{error:'保存できませんでした'});return;}saveOrder.push('passcode');passcodeSet=!!body.passcode;reply(200,{message:'パスコード更新'});return;}
@@ -111,6 +123,17 @@ try{
   check(await evaluate('!document.getElementById("login-form") && !document.getElementById("admin-form") && !document.getElementById("logout")'),'local network opens settings without Web login or password controls');
   check(await evaluate('document.querySelectorAll(".button-card").length === 9 && document.querySelectorAll(".macro-card").length === 5'),'nine buttons and five editable shortcuts render');
   check(await evaluate('activeTab==="buttons" && document.querySelectorAll("nav [data-tab]").length===3'),'opens directly to button assignments with three tabs');
+  const idleStart=statusRequests.length;
+  await new Promise(resolve=>setTimeout(resolve,1300));
+  const idleRequests=statusRequests.slice(idleStart);
+  check(idleRequests.length>=1 && idleRequests.length<=2 && idleRequests.every(request=>!request),
+    'ordinary screens poll about once a second and do not request log data');
+  await evaluate(`Object.defineProperty(document,'hidden',{value:true,configurable:true});
+    document.dispatchEvent(new Event('visibilitychange'));`);
+  const hiddenStart=statusRequests.length;
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  check(statusRequests.length===hiddenStart,'a background page makes no new status requests');
+  await evaluate(`delete document.hidden;document.dispatchEvent(new Event('visibilitychange'));`);
   const stopStartsHidden=await evaluate('document.getElementById("stop").hidden');
   macroBusy=true;
   await wait('!document.getElementById("stop").hidden');
@@ -118,16 +141,48 @@ try{
   await wait('document.getElementById("stop").hidden');
   check(stopStartsHidden && stopRequests===1 && !macroBusy,'the stop button appears only during a send and cancels it');
   await evaluate(`document.querySelector('[data-tab="settings"]').click()`);
+  await wait('document.getElementById("metric-0-0").textContent==="3,890" && liveMonitorVisible && document.getElementById("chart-0").width>300');
   check(await evaluate('document.getElementById("metric-0-0").textContent==="3,890" && [...document.querySelectorAll("#live-cards canvas")].every(chart=>chart.width>300)'),'two live charts are drawn in settings');
+  await evaluate(`document.getElementById('operation-log').open=true;`);
+  await wait('document.querySelector("#logs li")');
+  const liveStart=statusRequests.length;
+  await evaluate(`globalThis.logRow=document.querySelector('#logs li');
+    globalThis.canvasChanges=0;
+    const canvasObserver=new MutationObserver(records=>{canvasChanges+=records.length;});
+    for (const chart of document.querySelectorAll('#live-cards canvas')) canvasObserver.observe(chart,{attributes:true,attributeFilter:['width','height']});`);
+  await new Promise(resolve=>setTimeout(resolve,750));
+  check(statusRequests.slice(liveStart).filter(Boolean).length>=2 &&
+    await evaluate('document.querySelector("#logs li")===logRow && canvasChanges===0'),
+    'live monitoring remains fast without recreating unchanged logs or resizing canvas buffers');
+  await evaluate(`document.getElementById('operation-log').open=false;`);
   bleEncrypted=false;
-  await wait('document.getElementById("ble-state").textContent==="接続準備中"');
+  await wait('document.getElementById("ble-state").textContent==="暗号化待ち"');
   check(await evaluate(`document.getElementById('ble-encryption').textContent==='準備中' &&
-    document.getElementById('ble-keyboard').textContent==='使用可能' && document.getElementById('ble-paired').textContent==='1台'`),
+    document.getElementById('ble-advertising').textContent==='接続済み' &&
+    document.getElementById('ble-keyboard').textContent==='準備中' && document.getElementById('ble-paired').textContent==='1台'`),
     'Bluetooth panel distinguishes the link, security, key services and saved pairings');
+  bleEncrypted=bleMapRead=true;
+  bleKeyboard=bleMedia=false;
+  bleDisconnectReason=0x213;
+  await wait('document.getElementById("ble-state").textContent==="キー通知待ち"');
+  check(await evaluate(`document.getElementById('ble-encryption').textContent==='完了' &&
+    document.getElementById('ble-diagnostic').textContent.includes('読み取りあり') &&
+    document.getElementById('ble-diagnostic').textContent.includes('0x213') &&
+    document.getElementById('ble-diagnostic').textContent.includes('サービス情報の再確認を通知 1回') &&
+    document.getElementById('ble-diagnostic').textContent.includes('自動再試行済み')`), 'encrypted links show service refresh and the end of automatic recovery');
+  bleProtocol='boot';
+  bleKeyboard=true;
+  await wait('document.getElementById("ble-state").textContent==="一部操作可能"');
+  check(await evaluate(`document.getElementById('ble-keyboard').textContent==='使用可能' &&
+    document.getElementById('ble-media').textContent==='互換モードでは使用不可'`), 'boot protocol can expose keyboard-only operation');
+  bleProtocol='report';
+  bleMedia=true;
   await evaluate(`document.getElementById('reconnect-ble').click()`);
   await wait('document.getElementById("ble-advertising").textContent==="受付中"');
-  check(bleReconnectRequests===1 && await evaluate('document.getElementById("ble-paired").textContent==="1台"'),
-    'Bluetooth reconnect returns to advertising while retaining saved pairings');
+  check(bleReconnectRequests===1 && await evaluate(`document.getElementById('ble-paired').textContent==='1台' &&
+    document.getElementById('ble-diagnostic').textContent.includes('20 ms間隔') &&
+    document.getElementById('ble-diagnostic').textContent.includes('自動再接続の試行 1回')`),
+    'Bluetooth reconnect retains pairings and displays the advertising interval and retry count');
   await evaluate(`fill('#ble-fields','端末に表示されるBluetooth名','運転席 Steering');document.getElementById('ble-enabled-input').click();
     document.getElementById('save').click();`);
   await wait('!dirty && document.getElementById("ble-state").textContent==="無効"');
@@ -152,9 +207,17 @@ try{
   check(await evaluate('document.querySelectorAll(".button-card").length===10 && document.getElementById("button-name-input").value==="ボタン2"'),'submitting adds a card and advances the default name');
   await evaluate(`document.getElementById('cancel-button-name').click();[...document.querySelectorAll('.learn-button')].at(-1).click();`);
   await wait('document.getElementById("learn-dialog").open && !document.getElementById("capture-1").disabled');
-  check(await evaluate('currentStatus.bleSuspended && document.getElementById("learn-mv-0").textContent==="3050 mV" && document.getElementById("learn-mv-1").textContent==="2750 mV"'),'learning displays both measured voltages with output paused');
-  await evaluate(`document.getElementById('capture-1').click();`);
-  await wait('!document.getElementById("learn-dialog").open && !currentStatus.bleSuspended');
+  check(await evaluate('currentStatus.inputModePaused && currentStatus.bleConnected && document.getElementById("learn-mv-0").textContent==="3050 mV" && document.getElementById("learn-mv-1").textContent==="2750 mV"'),'learning displays both measured voltages with key output paused and Bluetooth connected');
+  delayInputResume=true;
+  const beforeLearningTest=testedActions.length;
+  await evaluate(`document.getElementById('capture-1').click();
+    const volumeId=config.buttons.find(button=>button.shortAction==='volume_up').id;
+    const test=document.querySelector('[data-button-id="'+volumeId+'"] button[aria-label="短押しをテスト"]');
+    test.click();test.click();`);
+  await wait('!document.getElementById("learn-dialog").open && !currentStatus.inputModePaused && !testPending');
+  check(pausedTestRequests===0 && testedActions.slice(beforeLearningTest).join(',')==='volume_up',
+    'testing immediately after learning waits for the resume response and queues no duplicate command');
+  delayInputResume=false;
   check(await evaluate('config.buttons[9].channel===1 && config.buttons[9].center===2750 && dirty'),'KEY2 capture assigns the channel and voltage to the draft card');
   check(state.buttons.length===9,'learning does not silently save the card');
   await evaluate(`config.buttons[9].name='<img src=x onerror=alert(1)>';renderButtons();`);
@@ -170,7 +233,7 @@ try{
   await evaluate(`document.getElementById('message').hidden=true;
     document.querySelector('[data-button-id="phone_on"] button[aria-label="数字入力をテスト"]').click();`);
   await wait('!document.getElementById("message").hidden && document.getElementById("message").textContent.includes("テストを開始")');
-  check(testedActions.join(',')==='test_digits','the passcode card requests the sample digits action');
+  check(testedActions.at(-1)==='test_digits','the passcode card requests the sample digits action');
   const cardActions=['play_pause','next','previous'];
   for (const [index, action] of cardActions.entries()) {
     await evaluate(`setAction(${index},${JSON.stringify(action)});document.getElementById('message').hidden=true;testButtons()[${index}].click();`);
@@ -290,7 +353,7 @@ try{
   check(saveOrder.filter(x=>x==='passcode').length===priorPinSaves+1&&await evaluate('csrf==="restarted-token" && document.getElementById("passcode").value==="6042"'),'device token refresh retries a rejected save once without losing input');
   const beforeDesktopFocus=inputModeRequests.length;
   await evaluate(`document.getElementById('wifi-password').focus();document.getElementById('passcode').focus()`);
-  check(inputModeRequests.length===beforeDesktopFocus,'desktop password focus does not pause Bluetooth');
+  check(inputModeRequests.length===beforeDesktopFocus,'desktop password focus does not pause key output');
   await call('Page.addScriptToEvaluateOnNewDocument',{source:`
     Object.defineProperty(navigator,'platform',{value:'MacIntel'});
     Object.defineProperty(navigator,'maxTouchPoints',{value:5});
@@ -298,11 +361,29 @@ try{
   await call('Page.reload');
   await wait('typeof isTouchEditor !== "undefined" && isTouchEditor && typeof currentStatus !== "undefined" && currentStatus.bleConnected');
   check(await evaluate('!document.querySelector("#input-mode, [data-input-mode]")'),'the input mode buttons are removed');
+  delayInputMode=true;delayInputResume=true;
+  const beforeTouchTest=testedActions.length, beforeTouchPause=inputModeRequests.length;
+  await evaluate(`const volumeId=config.buttons.find(button=>button.shortAction==='volume_up').id;
+    const card=document.querySelector('[data-button-id="'+volumeId+'"]');
+    card.querySelector('input[type="text"]').focus();
+    card.querySelector('button[aria-label="短押しをテスト"]').click();`);
+  await wait('!inputModeRequest && !testPending');
+  check(await evaluate('!activeInputField() && document.getElementById("message").textContent.includes("テストを開始")') &&
+    pausedTestRequests===0 && testedActions.slice(beforeTouchTest).join(',')==='volume_up' &&
+    inputModeRequests.slice(beforeTouchPause).map(request=>request.enabled).join(',')==='true,false',
+    'one touchscreen test click closes a focused field and waits for its in-flight pause and resume');
+  delayInputMode=false;delayInputResume=false;
   await evaluate(`document.querySelector('[data-tab="settings"]').click();document.getElementById('wifi-password').focus()`);
-  await wait('currentStatus.bleSuspended && !currentStatus.bleConnected && !inputModeRequest');
-  check(await evaluate('document.activeElement.id==="wifi-password" && !document.getElementById("input-mode-help").hidden'),
-    'touchscreen password focus pauses BLE without replacing or blurring the field');
+  await wait('currentStatus.inputModePaused && !inputModeRequest');
+  check(await evaluate(`document.activeElement.id==='wifi-password' && currentStatus.bleReady &&
+    currentStatus.bleConnected && !currentStatus.bleSuspended && document.getElementById('input-mode-help').textContent.includes('キー送信')`),
+    'touchscreen password focus pauses key output while the Bluetooth link and field stay active');
   await wait('!document.getElementById("field-keyboard").hidden');
+  await evaluate(`Object.defineProperty(visualViewport,'height',{value:document.documentElement.clientHeight-250,configurable:true});
+    visualViewport.dispatchEvent(new Event('resize'));`);
+  check(await evaluate(`document.getElementById('field-keyboard').hidden && document.activeElement.id==='wifi-password' &&
+    currentStatus.inputModePaused && currentStatus.bleReady`), 'opening the system keyboard keeps Bluetooth ready and hides the fallback keyboard');
+  await evaluate(`delete visualViewport.height;visualViewport.dispatchEvent(new Event('resize'));`);
   await evaluate(`globalThis.pressPageKey=(label)=>[...document.querySelectorAll('#field-keyboard button')].find(button=>button.textContent===label).click();
     pressPageKey('ABC');pressPageKey('A');pressPageKey('abc');pressPageKey('b');pressPageKey('1');
     pressPageKey('記号');pressPageKey('!');pressPageKey('空白');pressPageKey('削除');`);
@@ -312,15 +393,15 @@ try{
   await evaluate(`document.getElementById('passcode').focus()`);
   await new Promise(resolve=>setTimeout(resolve,350));
   check(inputModeRequests.slice(beforeSwitch).every(request=>request.enabled) &&
-    await evaluate('document.activeElement.id==="passcode" && currentStatus.bleSuspended'),
-    'moving between fields keeps BLE paused');
+    await evaluate('document.activeElement.id==="passcode" && currentStatus.inputModePaused && currentStatus.bleConnected'),
+    'moving between fields keeps key output paused with Bluetooth connected');
   await wait('!document.getElementById("field-keyboard").hidden');
   await evaluate(`pressPageKey('0');pressPageKey('2');pressPageKey('4');pressPageKey('6');`);
   check(await evaluate('document.getElementById("passcode").value==="0246" && passcodeDirty && !document.querySelector("#field-keyboard button").form.querySelector("#wifi-password")'),
     'the numeric keypad enters a passcode including leading zeroes');
   await evaluate(`pressPageKey('完了')`);
-  await wait('!currentStatus.bleSuspended && !inputModeRequest');
-  check(await evaluate('document.getElementById("input-mode-help").hidden && document.getElementById("field-keyboard").hidden'),'finishing input closes the keypad and restores Bluetooth');
+  await wait('!currentStatus.inputModePaused && !inputModeRequest');
+  check(await evaluate('currentStatus.bleReady && document.getElementById("input-mode-help").hidden && document.getElementById("field-keyboard").hidden'),'finishing input closes the keypad and resumes key output');
   delayInputMode=true;
   const beforeQuickBlur=inputModeRequests.length;
   await evaluate(`document.getElementById('passcode').focus();document.getElementById('passcode').blur()`);
@@ -329,10 +410,17 @@ try{
     'a blur during a pending pause still sends a resume');
   delayInputMode=false;
   await evaluate(`document.getElementById('passcode').focus()`);
-  await wait('currentStatus.bleSuspended && !inputModeRequest');
+  await wait('currentStatus.inputModePaused && !inputModeRequest');
   await evaluate(`window.dispatchEvent(new PageTransitionEvent('pagehide'))`);
-  await wait('!currentStatus.bleSuspended && !inputModeRequest');
-  check(inputModeRequests.at(-1).enabled===false,'leaving the page releases the pause');
+  await wait('!inputModeRequested && !inputModeRequest');
+  check(!inputModePaused && inputModeRequests.at(-1).enabled===false,'leaving the page releases the pause');
+  await evaluate(`document.activeElement.blur();window.dispatchEvent(new PageTransitionEvent('pageshow'));`);
+  await evaluate(`document.getElementById('ble-name-input').focus()`);
+  await wait('currentStatus.inputModePaused && !document.getElementById("field-keyboard").hidden');
+  await evaluate(`renderAll()`);
+  await wait('!currentStatus.inputModePaused && !inputModeRequest');
+  check(await evaluate('document.getElementById("field-keyboard").hidden && currentStatus.bleReady'),
+    'replacing an edited field returns the fallback keyboard and resumes output without reconnecting');
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'setup-direct.png'),Buffer.from(shot.data,'base64'));
   await evaluate(`document.getElementById('discard').click()`);
   check(await evaluate(`document.getElementById('firmware-version').textContent==='1.0.1' &&

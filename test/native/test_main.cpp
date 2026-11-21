@@ -3,6 +3,7 @@
 #include "keys.h"
 #include "connection.h"
 #include "access.h"
+#include "ble_reconnect.h"
 #include "network_state.h"
 #include "ota_release.h"
 #include <iostream>
@@ -12,6 +13,7 @@ using namespace sw;
 namespace {
 int passed = 0;
 bool transportReady = true, transportSuccess = true;
+bool keyboardSubscribed = true, mediaSubscribed = true;
 std::vector<std::string> reports;
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 void test(const char* name, const std::function<void()>& fn) {
@@ -43,10 +45,12 @@ struct Harness {
 };
 }
 namespace sw {
-bool hidReady() { return transportReady; }
-bool sendKey(uint8_t key,uint8_t modifiers) { reports.push_back("key:"+std::to_string(key)+":"+std::to_string(modifiers)); return transportReady&&transportSuccess; }
-bool sendMedia(uint16_t usage) { reports.push_back("media:"+std::to_string(usage)); return transportReady&&transportSuccess; }
-bool releaseHid() { reports.push_back("release"); return transportReady&&transportSuccess; }
+bool hidReady() { return hidKeyboardReady() || hidMediaReady(); }
+bool hidKeyboardReady() { return transportReady && keyboardSubscribed; }
+bool hidMediaReady() { return transportReady && mediaSubscribed; }
+bool sendKey(uint8_t key,uint8_t modifiers) { reports.push_back(key ? "key:"+std::to_string(key)+":"+std::to_string(modifiers) : "key-release"); return hidKeyboardReady()&&transportSuccess; }
+bool sendMedia(uint16_t usage) { reports.push_back(usage ? "media:"+std::to_string(usage) : "media-release"); return hidMediaReady()&&transportSuccess; }
+void releaseHid() { reports.push_back("release"); }
 }
 int main(int argc,char** argv) {
   if(argc>1&&std::string(argv[1])=="--fixture") { JsonDocument doc;toJson(defaults(),doc.to<JsonObject>());std::string json;serializeJson(doc,json);std::cout<<json;return 0; }
@@ -74,6 +78,39 @@ int main(int argc,char** argv) {
   });
   test("clearing Wi-Fi disables all connection attempts",[]{NetworkSchedule n;n.configure(0,true);n.update(300,false);n.configure(500,false);require(n.update(100000,false)==NetworkAction::None,"disabled network retried");});
   test("Wi-Fi connection timing survives millis wrap",[]{NetworkSchedule n;n.configure(UINT32_MAX-200,true);require(n.update(98,false)==NetworkAction::None,"wrap started early");require(n.update(99,false)==NetworkAction::Begin,"wrap begin missing");require(n.update(30099,false)==NetworkAction::Disconnect,"wrap timeout missing");});
+  test("BLE starts fast advertising at boot and after each disconnect", [] {
+    BleReconnectSchedule schedule;
+    require(schedule.fastAdvertising(), "boot did not request fast advertising");
+    schedule.advertisingStarted();
+    require(!schedule.fastAdvertising(), "advertising timeout would request a second fast window");
+    schedule.disconnected();
+    require(schedule.fastAdvertising(), "disconnect did not restart fast advertising");
+  });
+  test("BLE refreshes services before one reconnect and preserves the retry limit across link drops", [] {
+    BleReconnectSchedule schedule;
+    using Action = BleRecoveryAction;
+    require(schedule.update(0, false, true) == Action::None, "first attempt too early");
+    require(schedule.update(9999, false, true) == Action::None, "reports did not get a full timeout");
+    require(schedule.update(10000, false, true) == Action::RefreshServices, "did not refresh services");
+    require(schedule.update(19999, false, true) == Action::None, "refresh did not get a full timeout");
+    require(schedule.update(20000, false, true) == Action::Reconnect && schedule.retryUsed(), "stalled link was not retried");
+    schedule.disconnected();
+    require(schedule.update(21000, false, true) == Action::None, "retried on connection");
+    require(schedule.update(90000, false, true) == Action::None && schedule.retryUsed(), "entered a reconnect loop");
+    require(schedule.update(90001, true, false) == Action::None && !schedule.retryUsed(), "healthy link did not reset recovery");
+    require(schedule.update(100000, false, true) == Action::None, "healthy reports did not clear the wait timer");
+    require(schedule.update(110000, false, true) == Action::RefreshServices, "new outage could not refresh services");
+    schedule.resetRecovery();
+    require(schedule.update(120000, false, true) == Action::None, "manual reset kept the old wait timer");
+    require(schedule.update(130000, false, true) == Action::RefreshServices, "manual reset kept the old recovery step");
+  });
+  test("BLE stalled link timeout survives millis wrap", [] {
+    BleReconnectSchedule schedule;
+    constexpr uint32_t start = UINT32_MAX - 200;
+    require(schedule.update(start, false, true) == BleRecoveryAction::None, "started recovery before wrap");
+    require(schedule.update(9798, false, true) == BleRecoveryAction::None, "wrapped timeout fired early");
+    require(schedule.update(9799, false, true) == BleRecoveryAction::RefreshServices, "wrapped timeout did not fire");
+  });
   test("all local clients can read configuration without login",[]{require(checkAccess(true,false,false),"local read rejected");require(checkAccess(true,true,true),"local write rejected");});
   test("local writes still need the automatic CSRF token",[]{require(!checkAccess(true,true,false),"write without token accepted");require(checkAccess(true,false,false),"read needs token");});
   test("foreign hostnames are rejected for reads and writes",[]{require(!checkAccess(false,false,false),"foreign read accepted");require(!checkAccess(false,true,true),"token bypassed host restriction");});
@@ -203,7 +240,26 @@ int main(int argc,char** argv) {
   test("passcode gate rejects non-long and enforces 10 seconds across wrap",[]{PasscodeGate g;require(!g.allow(0,Gesture::Short),"short");require(g.allow(UINT32_MAX-1000,Gesture::Long),"first");require(!g.allow(500,Gesture::Long),"cooldown");require(g.allow(10000,Gesture::Long),"after cooldown");});
   test("ACC requires prior ON and emits once per OFF",[]{AccDetector a;require(!a.update(0,0,1000,100),"boot off");a.update(10,2000,1000,100);require(!a.update(20,0,1000,100),"early");require(a.update(120,0,1000,100),"fall");require(!a.update(500,0,1000,100),"repeated");a.update(600,2000,1000,100);a.update(700,0,1000,100);require(a.update(800,0,1000,100),"next cycle");});
   test("ASCII supports every printable character",[]{for(int c=32;c<127;++c){uint8_t key=0,mod=0;require(asciiKey(c,key,mod)&&key>=4&&key<=115,"ascii missing");}uint8_t key,mod;require(!asciiKey(128,key,mod),"non ascii");});
-  test("macro runner sends press, release, wait, text in order",[]{transportReady=transportSuccess=true;reports.clear();MacroRunner r;Step a;a.type="chord";a.key=30;a.modifiers=7;Step w;w.type="wait";w.ms=100;Step t;t.type="text";t.text="A0";require(r.start({a,w,t}),"start");for(uint32_t now=0;now<500;now+=5)r.tick(now);require(!r.busy(),"not completed");std::vector<std::string> expected={"key:30:7","release","key:4:2","release","key:39:0","release","release"};require(reports==expected,"report order");});
+  test("macro runner sends press, release, wait, text in order",[]{transportReady=transportSuccess=true;reports.clear();MacroRunner r;Step a;a.type="chord";a.key=30;a.modifiers=7;Step w;w.type="wait";w.ms=100;Step t;t.type="text";t.text="A0";require(r.start({a,w,t}),"start");for(uint32_t now=0;now<500;now+=5)r.tick(now);require(!r.busy(),"not completed");std::vector<std::string> expected={"key:30:7","key-release","key:4:2","key-release","key:39:0","key-release","release"};require(reports==expected,"report order");});
+  test("keyboard and media subscriptions allow their own actions independently", [] {
+    Step key; key.type = "chord"; key.key = 30;
+    Step media; media.type = "media"; media.usage = 233;
+    MacroRunner runner;
+    reports.clear();
+    mediaSubscribed = false;
+    require(!runner.start({key, media}) && reports.empty(), "partial macro accepted");
+    require(runner.start({key}), "keyboard-only action blocked");
+    for (uint32_t now = 0; now < 100; now += 5) runner.tick(now);
+    require(reports == std::vector<std::string>{"key:30:0", "key-release", "release"}, "wrong keyboard release");
+    reports.clear();
+    keyboardSubscribed = false;
+    require(!runner.start({media}), "action accepted without notifications");
+    mediaSubscribed = true;
+    require(runner.start({media}), "media-only action blocked");
+    for (uint32_t now = 0; now < 100; now += 5) runner.tick(now);
+    require(reports == std::vector<std::string>{"media:233", "media-release", "release"}, "wrong media release");
+    keyboardSubscribed = true;
+  });
   test("disconnect cancels macro and cannot replay on reconnect",[]{transportReady=transportSuccess=true;reports.clear();MacroRunner r;Step s;s.type="text";s.text="1234";r.start({s});r.tick(0);transportReady=false;require(r.tick(5)==-1&&!r.busy(),"not cancelled");size_t n=reports.size();transportReady=true;r.tick(500);require(reports.size()==n,"replayed");});
   test("failed notification aborts macro instead of retrying text",[]{transportReady=true;transportSuccess=false;reports.clear();MacroRunner r;Step s;s.type="text";s.text="1234";r.start({s});require(r.tick(0)==-1&&!r.busy(),"not aborted");transportSuccess=true;r.tick(1000);require(reports.size()==2,"retried");});
   std::cout<<passed<<" tests passed\n";

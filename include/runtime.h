@@ -29,7 +29,7 @@ class Runtime {
   PasscodeGate passcodeGate_;
   MacroRunner runner_;
   uint32_t hidEpoch_ = 0;
-  bool ready_ = false;
+  bool ready_ = false, inputModePaused_ = false;
   int accMv_ = 0;
   uint32_t samples_ = 0;
   void tick();
@@ -41,11 +41,12 @@ class Runtime {
   bool hasSamples();
   bool stopHidForFirmware();
   bool resumeHidAfterFirmware();
-  bool reconnectHid(bool suspended);
+  bool reconnectHid();
   Config config();
   void apply(const Config& cfg);
   void setPasscode(const String& passcode);
-  void status(JsonObject out);
+  void setInputMode(bool enabled);
+  void status(JsonObject out, bool includeLogs);
   void log(const String& message);
   bool startLearning(int channel, String& error);
   void stopLearning();

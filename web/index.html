@@ -14,7 +14,7 @@
 <p><strong>普段の操作：</strong>ESP32に電源を入れ、接続先の端末の「設定 → Bluetooth」で「<span id="guide-ble-name">Steering Switch</span>」を最初に一度登録します。次回からは再接続して使います。Wi-Fiは設定を変更するときだけ使います。</p>
 <ol><li><strong>設定用Wi-Fiを開く：</strong>設定用Wi-FiはESP32の電源投入時に起動します。見つからないときは起動後にBOOTボタンを3秒押してください。</li><li><strong>端末を接続する：</strong>スマートフォンやタブレットのWi-Fi設定で「SteeringSW-」から始まる名前を選び、初回に控えたパスワードを入力します。</li><li><strong>設定画面を開く：</strong>自動表示された画面で、そのまま設定できます。表示されない場合はブラウザーで <a href="http://192.168.4.1/">http://192.168.4.1/</a> を開きます。Webのパスワード入力は不要です。</li></ol>
 <p>「インターネット未接続」と表示されても、設定用Wi-Fiとして使用できます。設定が終わったら普段のWi-Fiへ戻してください。</p>
-<p class="muted">接続先の端末の画面ロック解除用パスコードは別のものです。タッチ端末で入力欄を選ぶとBluetoothを一時停止し、入力欄から離れると再接続します。</p>
+<p class="muted">接続先の端末の画面ロック解除用パスコードは別のものです。タッチ端末で入力欄を選ぶと、Bluetooth接続を保ったままキー送信を一時停止します。</p>
 </details>
 <div id="workspace" hidden>
 <div class="toolbar"><span id="device-name"></span><span id="output-state" class="badge"></span><button id="stop" type="button" class="secondary" hidden>送信を中止</button></div>
@@ -32,7 +32,7 @@
   <h3>入力のライブモニター</h3>
   <div id="live-cards" class="two-col"></div>
   <details><summary>入力の詳細設定</summary><p class="muted">未押下の中心値を設定するときは、すべてのスイッチを離してください。</p><div id="input-cards" class="two-col"></div></details>
-  <details><summary>接続と操作ログ</summary><p id="network-status"></p><p id="learn-status" class="muted"></p><ol id="logs" class="logs"></ol></details>
+  <details id="operation-log"><summary>接続と操作ログ</summary><p id="network-status"></p><p id="learn-status" class="muted"></p><ol id="logs" class="logs"></ol></details>
 </section>
 <div class="two-col"><section class="panel"><h3>動作設定</h3><div id="general-fields" class="fields"></div><p class="muted">初回は校正を完了し、未押下で何も認識されないことを確認してからキー送信を有効にしてください。</p></section><section class="panel" id="wifi-panel"><h3>Wi-Fi接続</h3><p>ESP32を家庭・車内の2.4GHz Wi-Fiへ接続します。設定の保存と、Wi-Fiへの接続成功は別々に表示します。</p>
 <p id="wifi-saved-state" class="save-state">保存状態を確認しています…</p>
@@ -49,12 +49,13 @@
 <section class="panel" id="ble-panel">
   <div class="card-heading"><h3>Bluetooth接続</h3><span id="ble-state" class="badge">確認中</span></div>
   <dl class="ble-details">
-    <div><dt>接続待ち</dt><dd id="ble-advertising">—</dd></div>
+    <div><dt>接続受付</dt><dd id="ble-advertising">—</dd></div>
     <div><dt>暗号化</dt><dd id="ble-encryption">—</dd></div>
     <div><dt>キーボード</dt><dd id="ble-keyboard">—</dd></div>
     <div><dt>メディアキー</dt><dd id="ble-media">—</dd></div>
     <div><dt>ペアリング済み</dt><dd id="ble-paired">—</dd></div>
   </dl>
+  <p id="ble-diagnostic" class="muted" hidden></p>
   <div id="ble-fields" class="fields"></div>
   <p class="muted">名前や有効設定は「保存・適用」で反映します。</p>
   <div class="actions"><button type="button" id="reconnect-ble" class="secondary" disabled>再接続</button><button type="button" id="forget-ble" class="secondary" disabled>ペアリングを削除して再起動</button></div>

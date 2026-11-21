@@ -8,16 +8,19 @@
 namespace sw {
 struct HidState {
   std::atomic<bool> connected{false}, encrypted{false}, keyboardSubscribed{false}, mediaSubscribed{false};
+  std::atomic<bool> bootMode{false}, bootKeyboardSubscribed{false}, reportMapRead{false};
   std::atomic<bool> suspended{false};
   std::atomic<uint32_t> epoch{0};
+  std::atomic<int> disconnectReason{0};
+  std::atomic<uint32_t> automaticReconnects{0};
+  uint32_t serviceRefreshes = 0;
+  uint16_t advertisingIntervalUnits = 0;
 };
 extern HidState hidState;
 bool beginHid(const std::string& name);
 bool setHidName(const std::string& name);
 bool stopHid();
 void setHidSuspended(bool suspended);
-bool hidReady();
-bool sendKey(uint8_t key, uint8_t modifiers);
-bool sendMedia(uint16_t usage);
-bool releaseHid();
+void maintainHid();
+bool hidAutomaticRetryUsed();
 }

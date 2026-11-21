@@ -41,13 +41,13 @@ bool Runtime::resumeHidAfterFirmware() {
   Guard lock(mutex_);
   return beginHid(cfg_.ble.name);
 }
-bool Runtime::reconnectHid(bool suspended) {
+bool Runtime::reconnectHid() {
   Guard lock(mutex_);
   runner_.cancel();
   resetEngines();
   setHidSuspended(true);
   const bool named = setHidName(cfg_.ble.name);
-  setHidSuspended(suspended || !cfg_.ble.enabled);
+  setHidSuspended(!cfg_.ble.enabled);
   return named;
 }
 void Runtime::resetEngines() {
@@ -69,12 +69,20 @@ void Runtime::setPasscode(const String& passcode) {
   Guard lock(mutex_); runner_.cancel(); passcode_ = passcode; resetEngines();
   logLocked(passcode.isEmpty() ? "パスコードを削除しました" : "パスコードを更新しました（内容は非表示）");
 }
+void Runtime::setInputMode(bool enabled) {
+  Guard lock(mutex_);
+  if (inputModePaused_ == enabled) return;
+  inputModePaused_ = enabled;
+  if (enabled) runner_.cancel();
+  resetEngines();
+  logLocked(enabled ? "設定画面の操作中はキー送信を一時停止します" : "キー送信の一時停止を解除しました");
+}
 bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool physical, String& error) {
   if (action == "none") return true;
   if (!cfg_.outputEnabled) { error = "キー送信が無効です"; return false; }
   if (!cfg_.ble.enabled) { error = "Bluetoothが無効です"; return false; }
   if (learning_.active) { error = "学習中は送信できません"; return false; }
-  if (hidState.suspended) { error = "文字入力モード中は接続先の端末操作を停止しています"; return false; }
+  if (inputModePaused_) { error = "キー送信が一時停止中です。開いている設定画面で入力や学習を終了してください"; return false; }
   if (!hidReady()) { error = "BLEが操作可能な状態ではありません"; return false; }
   if (runner_.busy()) { error = "操作実行中のため追加操作を破棄しました"; return false; }
   std::vector<Step> steps;
@@ -104,7 +112,7 @@ bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool phys
     }
   }
   if (steps.empty()) { error = "操作の参照先がありません"; return false; }
-  if (!runner_.start(std::move(steps))) { error = "操作を開始できません"; return false; }
+  if (!runner_.start(std::move(steps))) { error = "この操作に必要なキー通知が準備中です"; return false; }
   logLocked(String("送信開始: ") + action.c_str() + "（成功状態は接続先の端末で確認）"); return true;
 }
 bool Runtime::test(const std::string& action, String& error) {
@@ -139,6 +147,7 @@ void Runtime::tick() {
     logLocked(ready ? "BLE操作可能。全キーを解放して未押下を待ちます" : "BLE待機中。保留操作を破棄しました");
   }
   if (int result = runner_.tick(now)) logLocked(result > 0 ? "送信手順が完了しました（接続先の端末の結果は未確認）" : "BLE送信失敗。操作を中止しました");
+  const bool canSend = ready && cfg_.outputEnabled && !inputModePaused_ && !learning_.active;
   bool pressed = false;
   for (int i = 0; i < kChannels; ++i) {
     auto& r = readings_[i]; const auto& ch = cfg_.channels[i];
@@ -160,7 +169,7 @@ void Runtime::tick() {
         ++l.count; double delta = value - l.mean; l.mean += delta / l.count; l.m2 += delta * (value - l.mean);
       } else ++l.invalid;
     }
-    if (!learning_.active && cfg_.outputEnabled && ready) {
+    if (canSend) {
       engines_[i].update(now, r.recognized, cfg_, [&](int b, Gesture g, const std::string& action) {
         String error;
         if (!actionLocked(action, g, true, error) && g != Gesture::Repeat)
@@ -175,7 +184,7 @@ void Runtime::tick() {
       l.error = "値が安定していません。ボタンを押し続けて再測定してください";
     logLocked(l.error.isEmpty() ? "学習完了。提案値はWeb画面で確認・適用してください" : l.error);
   }
-  if (cfg_.accEnabled && cfg_.outputEnabled && ready && !learning_.active) {
+  if (cfg_.accEnabled && canSend) {
     if (acc_.update(now, accMv_, cfg_.accThresholdMv, cfg_.accDebounceMs)) {
       runner_.cancel(); String error;
       if (!actionLocked("lock", Gesture::Short, false, error)) logLocked("ACCロック送信失敗: " + error);
@@ -183,19 +192,28 @@ void Runtime::tick() {
   } else acc_.reset();
   digitalWrite(ledPin, pressed || learning_.active || runner_.busy() ? HIGH : LOW);
 }
-void Runtime::status(JsonObject o) {
+void Runtime::status(JsonObject o, bool includeLogs) {
   Guard lock(mutex_);
   o["uptimeMs"] = millis(); o["samples"] = samples_; o["outputEnabled"] = cfg_.outputEnabled;
   o["bleConnected"] = hidState.connected.load(); o["bleReady"] = hidReady(); o["busy"] = runner_.busy();
   o["bleSuspended"] = hidState.suspended.load();
+  o["inputModePaused"] = inputModePaused_;
   auto ble = o["ble"].to<JsonObject>();
   ble["name"] = cfg_.ble.name;
   ble["enabled"] = cfg_.ble.enabled;
   ble["encrypted"] = hidState.encrypted.load();
-  ble["keyboardReady"] = hidState.keyboardSubscribed.load();
-  ble["mediaReady"] = hidState.mediaSubscribed.load();
+  ble["keyboardReady"] = hidKeyboardReady();
+  ble["mediaReady"] = hidMediaReady();
+  ble["protocolMode"] = hidState.bootMode ? "boot" : "report";
+  ble["reportMapRead"] = hidState.reportMapRead.load();
+  ble["disconnectReason"] = hidState.disconnectReason.load();
+  ble["automaticReconnects"] = hidState.automaticReconnects.load();
+  ble["serviceRefreshes"] = hidState.serviceRefreshes;
+  ble["automaticRetryUsed"] = hidAutomaticRetryUsed();
   if (NimBLEDevice::isInitialized()) {
-    ble["advertising"] = NimBLEDevice::getAdvertising()->isAdvertising();
+    const bool advertising = NimBLEDevice::getAdvertising()->isAdvertising();
+    ble["advertising"] = advertising;
+    if (advertising) ble["advertisingIntervalMs"] = hidState.advertisingIntervalUnits * 0.625;
     ble["bonds"] = NimBLEDevice::getNumBonds();
   } else {
     ble["advertising"] = false;
@@ -218,10 +236,12 @@ void Runtime::status(JsonObject o) {
   l["center"] = learning_.mean; l["minimum"] = learning_.minimum; l["maximum"] = learning_.maximum;
   double margin = cfg_.channels[learning_.channel].mode != "ohm" ? 10 : std::max(2.0, std::abs(learning_.mean) * 0.03);
   l["tolerance"] = std::max(learning_.maximum - learning_.mean, learning_.mean - learning_.minimum) + margin;
-  auto logs = o["logs"].to<JsonArray>();
-  for (size_t j = 0; j < logCount_; ++j) {
-    const auto& entry = logs_[(logCursor_ + 32 - logCount_ + j) % 32];
-    auto a = logs.add<JsonObject>(); a["at"] = entry.at; a["message"] = entry.message;
+  if (includeLogs) {
+    auto logs = o["logs"].to<JsonArray>();
+    for (size_t j = 0; j < logCount_; ++j) {
+      const auto& entry = logs_[(logCursor_ + 32 - logCount_ + j) % 32];
+      auto a = logs.add<JsonObject>(); a["at"] = entry.at; a["message"] = entry.message;
+    }
   }
 }
 } // namespace sw

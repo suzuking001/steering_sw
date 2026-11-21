@@ -2,9 +2,11 @@
 #include "model.h"
 namespace sw {
 bool hidReady();
+bool hidKeyboardReady();
+bool hidMediaReady();
 bool sendKey(uint8_t key, uint8_t modifiers);
 bool sendMedia(uint16_t usage);
-bool releaseHid();
+void releaseHid();
 class MacroRunner {
   std::vector<Step> steps_;
   size_t index_ = 0, textIndex_ = 0;

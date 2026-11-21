@@ -3,15 +3,21 @@ const $ = id => document.getElementById(id);
 const clone = obj => JSON.parse(JSON.stringify(obj));
 let config, saved, csrf = '', dirty = false, currentStatus, activeTab = 'buttons';
 let histories = [[], []], learningButton = null, polling = false, lastReadingAt = 0;
+let pollTimer, liveMonitorVisible = !('IntersectionObserver' in window), lastSettingsAt = -Infinity;
+const chartWindowMs = 30000;
+let renderedLogs = '';
 let saving = false;
 let wifiDirty = false, passcodeDirty = false, wifiSaving = false, passcodeSaving = false;
 let firmwareRequest = false, firmwareTarget = '';
+let testPending = false;
 const isTouchEditor = navigator.maxTouchPoints > 0;
 const inputModeClient = Array.from(crypto.getRandomValues(new Uint8Array(8)),
   byte => byte.toString(16).padStart(2, '0')).join('');
-let inputModeRequested = false, inputModeRequest = false, inputModeDesired = false;
+let inputModeRequested = false, inputModeRequest = null, inputModeDesired = false;
 let focusTimer, inputModeHeartbeat;
 const keyboardFields = ['wifi-ssid', 'wifi-password', 'passcode', 'button-name-input', 'ble-name-input'];
+const fieldKeyboard = $('field-keyboard');
+const fieldKeyboardHome = fieldKeyboard.parentElement;
 let keyboardField, keyboardTimer, keyboardLayout;
 let messageTimer;
 const builtins = [['none','未割り当て'],['volume_up','音量＋（押し続けで連続）'],['volume_down','音量－（押し続けで連続）'],['play_pause','再生／一時停止'],['mute','消音'],['next','次の曲'],['previous','前の曲'],['home','ホーム'],['switch_app','アプリ切り替え'],['maps','Googleマップ'],['youtube','YouTube'],['siri','Siri'],['lock','画面ロック'],['app_list','アプリ一覧'],['passcode','パスコード送信（長押し専用）']];
@@ -30,6 +36,10 @@ function el(tag, attrs = {}, ...children) {
 function note(message, error = false) {
   const node = $('message'); node.textContent = message; node.className = error ? 'error' : ''; node.hidden = false;
   clearTimeout(messageTimer); messageTimer = setTimeout(() => { node.hidden = true; }, error ? 14000 : 7000);
+}
+function setText(id, value) {
+  const node = $(id);
+  if (node.textContent !== value) node.textContent = value;
 }
 function hasChanges() { return dirty || wifiDirty || passcodeDirty; }
 function unsavedParts() { return [dirty?'本体設定':null, wifiDirty?'Wi-Fi':null, passcodeDirty?'端末パスコード':null].filter(Boolean); }
@@ -89,6 +99,7 @@ async function connectWorkspace() {
 }
 async function openWorkspace() {
   config = await api('config'); saved = clone(config); histories = [[],[]];
+  lastSettingsAt = -Infinity;
   wifiDirty = passcodeDirty = false;
   $('wifi-password').value=''; $('passcode').value='';
   $('show-wifi-password').checked=$('show-passcode').checked=false;
@@ -107,6 +118,7 @@ function renderAll() {
     field('端末に表示されるBluetooth名',config.ble,'name','text',{id:'ble-name-input',maxlength:29,autocomplete:'off'}),
     field('Bluetoothを有効にする',config.ble,'enabled','checkbox',{id:'ble-enabled-input'}));
   $('ble-name-input').closest('label').classList.add('wide');
+  checkInputFocus();
 }
 function renderLive() {
   $('live-cards').replaceChildren(...config.channels.map((ch,i) => el('section',{class:'panel'},
@@ -190,22 +202,23 @@ function openLearning(button) {
   $('learn-dialog').showModal();
   checkInputFocus();
   renderLearning();
+  poll();
 }
 function renderLearning() {
   if (!learningButton || !$('learn-dialog').open) return;
-  const ready = currentStatus?.bleSuspended && hasFreshReading();
+  const ready = currentStatus?.inputModePaused && hasFreshReading();
   for (let i=0; i<config.channels.length; i++) {
     const channel = config.channels[i], reading = currentStatus?.readings[i];
     const value = reading ? measuredValue(channel, reading) : null;
-    $('learn-mv-'+i).textContent = Number.isFinite(reading?.mv) ? Math.round(reading.mv) + ' mV' : '— mV';
-    $('learn-value-'+i).textContent = '判定値 ' + (Number.isFinite(value) ? Number(value.toFixed(1))+' '+channelUnit(channel.mode) : '—');
+    setText('learn-mv-'+i, Number.isFinite(reading?.mv) ? Math.round(reading.mv) + ' mV' : '— mV');
+    setText('learn-value-'+i, '判定値 ' + (Number.isFinite(value) ? Number(value.toFixed(1))+' '+channelUnit(channel.mode) : '—'));
     const full = !channelHasSpace(i, learningButton);
     const capture = $('capture-'+i);
     capture.disabled = !ready || !Number.isFinite(value) || full;
-    capture.textContent = full ? '登録上限（16個）' : '現在値を設定する';
+    setText('capture-'+i, full ? '登録上限（16個）' : '現在値を設定する');
   }
-  $('learn-feedback').textContent = ready ? '取り込んだ値と入力系統はカードに反映されます。' :
-    '測定値とキー送信の停止を確認しています…';
+  setText('learn-feedback', ready ? '取り込んだ値と入力系統はカードに反映されます。' :
+    '測定値とキー送信の停止を確認しています…');
 }
 function captureReading(index) {
   if (!learningButton || $('capture-'+index).disabled || !hasFreshReading()) return;
@@ -218,6 +231,7 @@ function captureReading(index) {
   $('learn-dialog').close();
   renderButtons();
   document.querySelector('[data-button-id="'+button.id+'"] .learn-button').focus();
+  checkInputFocus();
 }
 function channelHasSpace(channel, except) {
   return config.buttons.filter(button=>button !== except && button.channel===channel).length < 16;
@@ -226,7 +240,9 @@ function actionOptions(isLong) {
   return [...builtins.filter(([id])=>isLong || id!=='passcode'),...config.macros.map(m=>['macro:'+m.id,'マクロ：'+m.name])];
 }
 async function testAction(action) {
+  if (testPending) return;
   if (action==='test_digits' && !confirm('接続先のロックを解除して、メモの空欄を開いてください。テスト用に 0123456789 を送信します。')) return;
+  if ($('learn-dialog').open) throw new Error('学習画面を閉じてからテストしてください。');
   const macroId = action.startsWith('macro:') ? action.slice(6) : action;
   if (action.startsWith('macro:') || presetIds.includes(action)) {
     const draft = config.macros.find(macro => macro.id === macroId);
@@ -235,8 +251,25 @@ async function testAction(action) {
       throw new Error('マクロの変更を保存・適用してからテストしてください。');
     }
   }
-  const result = await api('test', 'POST', {action});
-  note(result.message);
+  testPending = true;
+  try {
+    // On touch browsers, tapping a button can leave the previous input focused.
+    if (activeInputField()) document.activeElement.blur();
+    clearTimeout(focusTimer);
+    checkInputFocus();
+    if (inputModeRequest || inputModeRequested) {
+      note('キー送信の再開を待っています…');
+      await inputModeRequest;
+      if (!inputModeDesired) await syncInputMode();
+    }
+    if (inputModeDesired || $('learn-dialog').open) throw new Error('入力や学習を終了してからテストしてください。');
+    if (inputModeRequested) throw new Error('キー送信の再開を確認できませんでした。接続を確認して再試行してください。');
+    const result = await api('test', 'POST', {action});
+    note(result.message);
+    poll();
+  } finally {
+    testPending = false;
+  }
 }
 function renderButtons() {
   const openDetails = new Set([...document.querySelectorAll('#button-cards details[open]')].map(detail=>detail.closest('[data-button-id]').dataset.buttonId));
@@ -365,21 +398,51 @@ function renderSettings() {
   $('acc-fields').replaceChildren(field('ACC連動を有効にする',config.acc,'enabled','checkbox'),
     field('OFFしきい値 mV',config.acc,'thresholdMv','number',{min:100,max:3000,step:1}),field('OFF安定判定 ms',config.acc,'debounceMs','number',{min:100,max:10000,step:1}));
 }
-function drawChart(i) {
+function drawChart(i, now = performance.now()) {
   const canvas=$('chart-'+i);if(!canvas||activeTab!=='settings')return;
   const rect=canvas.getBoundingClientRect();if(!rect.width)return;
   const ratio=window.devicePixelRatio||1,width=rect.width,height=170;
-  canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);
-  const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);
+  const pixelsWide=Math.round(width*ratio),pixelsHigh=Math.round(height*ratio);
+  if (canvas.width!==pixelsWide) canvas.width=pixelsWide;
+  if (canvas.height!==pixelsHigh) canvas.height=pixelsHigh;
+  const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,width,height);
   const data=histories[i];
-  const max=Math.max(3300, ...data.filter(Number.isFinite));
+  while (data.length && now-data[0].at>chartWindowMs) data.shift();
+  const max=Math.max(3300, ...data.map(point=>point.mv));
   const left=43,top=12,bottom=height-22,right=width-10;
   const y=value=>bottom-value/max*(bottom-top);
   ctx.font='10px sans-serif';ctx.textAlign='right';
   for(let t=0;t<=4;t++){const val=max*t/4;ctx.strokeStyle='#dfe9ef';ctx.beginPath();ctx.moveTo(left,y(val));ctx.lineTo(right,y(val));ctx.stroke();ctx.fillStyle='#607788';ctx.fillText(Math.round(val).toLocaleString(),left-5,y(val)+4);}
-  ctx.strokeStyle='#137d83';ctx.lineWidth=2;ctx.beginPath();let drawing=false;
-  data.forEach((value,n)=>{if(value===null){drawing=false;return;}const x=left+(n+150-data.length)/149*(right-left);if(!drawing)ctx.moveTo(x,y(value));else ctx.lineTo(x,y(value));drawing=true;});ctx.stroke();
+  ctx.strokeStyle='#137d83';ctx.lineWidth=2;ctx.beginPath();let previous=-Infinity;
+  for (const {at,mv} of data) {
+    const x=right-(now-at)/chartWindowMs*(right-left);
+    if (at-previous>1500) ctx.moveTo(x,y(mv)); else ctx.lineTo(x,y(mv));
+    previous=at;
+  }
+  ctx.stroke();
   ctx.fillStyle='#607788';ctx.textAlign='left';ctx.fillText('−30秒',left,height-5);ctx.textAlign='right';ctx.fillText('現在 · mV',right,height-5);
+}
+function renderLiveStatus(readings, now) {
+  for (const [i,r] of readings.entries()) {
+    setText('reading-button-'+i,r.button);
+    setText('metric-'+i+'-0',Math.round(r.adc).toLocaleString());
+    setText('metric-'+i+'-1',Math.round(r.mv).toLocaleString());
+    setText('metric-'+i+'-2',r.ohm===null?'測定不可':r.ohm.toLocaleString(undefined,{maximumFractionDigits:1}));
+    setText('reading-detail-'+i,'生ADC '+r.raw+' · 判定単位 '+channelUnit(r.mode)+' · 参考プリセットは実車で校正してください');
+    if (liveMonitorVisible && Number.isFinite(r.mv)) {
+      histories[i].push({at:now,mv:r.mv});
+      drawChart(i,now);
+    }
+  }
+}
+function renderOperationLogs(s) {
+  setText('network-status',(s.wifiConnected?'Wi-Fi '+s.ip+' / '+s.rssi+' dBm':'既存Wi-Fi 未接続')+(s.apActive?' · 設定用AP '+s.apName+' / '+s.apIp:'')+' · 稼働 '+Math.floor(s.uptimeMs/1000)+'秒 · 空きRAM '+Math.round(s.freeHeap/1024)+'KB');
+  setText('learn-status',s.learning.active?'学習中：キー送信を停止しています。残り '+(s.learning.remainingMs/1000).toFixed(1)+'秒':s.busy?'マクロ送信中':'入力監視中');
+  if (!Array.isArray(s.logs)) return;
+  const key=JSON.stringify(s.logs);
+  if (key===renderedLogs) return;
+  renderedLogs=key;
+  $('logs').replaceChildren(...s.logs.slice().reverse().map(log=>el('li',{},el('time',{},(log.at/1000).toFixed(1)+'s'),log.message)));
 }
 function wifiStatus(s) {
   const ssid=s.wifiSavedSsid ?? saved.ssid;
@@ -406,19 +469,34 @@ function wifiStatus(s) {
 function renderBle(s) {
   const ble = s?.ble;
   const ready = s?.bleReady;
+  const waiting = s?.bleConnected && ble?.encrypted && !ready;
+  const partial = ready && (!ble?.keyboardReady || !ble?.mediaReady);
   const state = !ble ? (s?.bleSuspended ? '一時停止中' : '通信待ち') : !ble.enabled ? '無効' : s.bleSuspended ? '一時停止中' :
-    ready ? '操作可能' : s.bleConnected ? '接続準備中' : ble.advertising ? '接続待ち' : '未接続';
+    ready ? (partial ? '一部操作可能' : '操作可能') : waiting ? 'キー通知待ち' : s.bleConnected ? '暗号化待ち' : ble.advertising ? '接続待ち' : '未接続';
   const badge = $('ble-state');
   if (badge.textContent !== state) badge.textContent = state;
   badge.className = 'badge '+(ready?'good':'warn');
   if (ble?.name) $('guide-ble-name').textContent = ble.name;
-  $('ble-advertising').textContent = ble ? (ble.advertising?'受付中':'停止中') : '—';
+  $('ble-advertising').textContent = ble ? (s.bleConnected?'接続済み':ble.advertising?'受付中':'停止中') : '—';
   $('ble-encryption').textContent = s?.bleConnected ? (ble?.encrypted?'完了':'準備中') : '—';
   $('ble-keyboard').textContent = s?.bleConnected ? (ble?.keyboardReady?'使用可能':'準備中') : '—';
-  $('ble-media').textContent = s?.bleConnected ? (ble?.mediaReady?'使用可能':'準備中') : '—';
+  $('ble-media').textContent = s?.bleConnected ? (ble?.mediaReady?'使用可能':ble?.protocolMode==='boot'?'互換モードでは使用不可':'準備中') : '—';
   $('ble-paired').textContent = Number.isInteger(ble?.bonds) ? ble.bonds+'台' : '—';
   $('reconnect-ble').disabled = !ble?.enabled || s.bleSuspended;
   $('forget-ble').disabled = !ble;
+  const details = [];
+  if (ble?.advertising && ble.advertisingIntervalMs > 0) details.push('接続待ち信号 '+ble.advertisingIntervalMs+' ms間隔');
+  if (s?.bleConnected && ble?.protocolMode) {
+    details.push(ble.protocolMode==='boot'?'入力方式 互換モード':'入力方式 標準モード');
+    details.push(ble.reportMapRead?'今回の接続でレポートマップの読み取りあり':'今回の接続でレポートマップの読み取りなし');
+  }
+  if (ble?.disconnectReason > 0) details.push('前回の切断コード 0x'+ble.disconnectReason.toString(16).toUpperCase());
+  if (ble?.serviceRefreshes > 0) details.push('サービス情報の再確認を通知 '+ble.serviceRefreshes+'回');
+  if (Number.isInteger(ble?.automaticReconnects)) details.push('自動再接続の試行 '+ble.automaticReconnects+'回');
+  if (waiting && ble.automaticRetryUsed) details.push('自動再試行済み。接続を維持してキー通知を待っています');
+  const diagnostics = $('ble-diagnostic');
+  diagnostics.textContent = details.join(' · ');
+  diagnostics.hidden = !details.length;
 }
 function renderFirmware(s) {
   const firmware = s?.firmware;
@@ -505,44 +583,50 @@ function renderInputMode() {
   const help = $('input-mode-help');
   let message = '';
   if (isTouchEditor && inputModeDesired && currentStatus?.ble?.enabled!==false && !$('learn-dialog').open) {
-    message = currentStatus?.bleSuspended && !currentStatus.bleConnected ?
-      '文字入力中はESP32とのBluetooth接続を一時停止しています。' :
-      '文字入力のためBluetoothを一時停止しています…';
+    message = currentStatus?.inputModePaused ?
+      '文字入力中はステアリングからのキー送信を一時停止しています。' :
+      '文字入力のためキー送信を一時停止しています…';
   }
   if (help.textContent !== message) help.textContent = message;
   help.hidden = !message;
 }
-async function syncInputMode() {
-  if (inputModeRequest || !csrf || (!inputModeDesired && !inputModeRequested)) return;
+function syncInputMode() {
+  if (inputModeRequest) return inputModeRequest;
+  if (!csrf || (!inputModeDesired && !inputModeRequested)) return;
   const enabled = inputModeDesired;
-  inputModeRequest = true;
   // A lost response can still mean that the device received the pause.
   if (enabled) inputModeRequested = true;
-  try {
-    await api('ble/input-mode', 'PUT', {enabled, client:inputModeClient});
+  inputModeRequest = api('ble/input-mode', 'PUT', {enabled, client:inputModeClient}).then(() => {
     inputModeRequested = enabled;
-  } catch (error) {
+  }).catch(error => {
     if (enabled && inputModeDesired) note(error.message, true);
     // The device expires its pause even if the resume request is lost.
-  } finally {
-    inputModeRequest = false;
+  }).finally(() => {
+    inputModeRequest = null;
     if (inputModeDesired !== enabled) syncInputMode();
-  }
+  });
+  return inputModeRequest;
 }
 function setInputFocus(focused) {
   if (inputModeDesired === focused) return;
   inputModeDesired = focused;
   clearInterval(inputModeHeartbeat);
-  if (focused) inputModeHeartbeat = setInterval(syncInputMode, 4000);
+  if (focused) inputModeHeartbeat = setInterval(() => {
+    checkInputFocus();
+    syncInputMode();
+  }, 4000);
   renderInputMode();
   syncInputMode();
 }
-function checkInputFocus() {
+function activeInputField() {
   const active = document.activeElement;
-  const field = $('field-keyboard').contains(active) ? keyboardField : active;
-  const editable = field?.matches('#workspace input:is([type="text"], [type="password"], [type="number"], :not([type])), #workspace textarea') &&
-    !field.disabled && !field.readOnly && !field.closest('[hidden]');
-  const focused = isTouchEditor && !document.hidden && editable ? field : null;
+  const field = fieldKeyboard.contains(active) ? keyboardField : active;
+  if (field?.matches('#workspace input:is([type="text"], [type="password"], [type="number"], :not([type])), #workspace textarea') &&
+      !field.disabled && !field.readOnly && !field.closest('[hidden]')) return field;
+  return null;
+}
+function checkInputFocus() {
+  const focused = isTouchEditor && !document.hidden ? activeInputField() : null;
   updateFieldKeyboard(focused && keyboardFields.includes(focused.id) ? focused : null);
   setInputFocus(!document.hidden && (!!focused || $('learn-dialog').open));
 }
@@ -550,10 +634,13 @@ function updateFieldKeyboard(field) {
   if (keyboardField === field) return;
   clearTimeout(keyboardTimer);
   keyboardField = field;
-  $('field-keyboard').hidden = true;
-  if (!field) return;
+  fieldKeyboard.hidden = true;
+  if (!field) {
+    fieldKeyboardHome.append(fieldKeyboard);
+    return;
+  }
   keyboardLayout = field.id === 'passcode' ? 'number' : 'lower';
-  field.closest('label').after($('field-keyboard'));
+  field.closest('label').after(fieldKeyboard);
   renderFieldKeyboard();
   // Safari can report the software keyboard's viewport change after an animation.
   keyboardTimer = setTimeout(() => {
@@ -566,7 +653,7 @@ function showFieldKeyboard() {
   const viewport = window.visualViewport;
   const nativeVisible = viewport && viewport.scale <= 1.1 &&
     document.documentElement.clientHeight - viewport.height > 140;
-  const panel = $('field-keyboard');
+  const panel = fieldKeyboard;
   if (nativeVisible || document.hidden) {
     panel.hidden = true;
   } else if (panel.hidden) {
@@ -584,7 +671,7 @@ function renderFieldKeyboard() {
   const key = (label, action, special = false) => el('button', {
     type:'button', class:special?'secondary':'', onclick:action
   }, label);
-  const panel = $('field-keyboard');
+  const panel = fieldKeyboard;
   const tools = el('div', {class:'field-keyboard-row'});
   if (keyboardLayout !== 'number') {
     const changeLayout = (layout, label) => key(label, () => {
@@ -614,10 +701,20 @@ function typeFieldKey(letter) {
   field.setRangeText(letter, start, end, 'end');
   field.dispatchEvent(new Event('input', {bubbles:true}));
 }
-async function poll() {
-  if(!csrf||polling)return;polling=true;
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  if (!csrf || document.hidden) return;
+  const fast = $('learn-dialog').open || (activeTab==='settings' && liveMonitorVisible) || currentStatus?.busy;
+  pollTimer = setTimeout(()=>poll(false),fast?200:1000);
+}
+async function poll(force = true) {
+  if (!csrf || polling || document.hidden) return;
+  clearTimeout(pollTimer);
+  polling=true;
   try {
-    const s=await api('status');
+    const includeLogs=activeTab==='settings' && $('operation-log').open;
+    const s=await api(includeLogs?'status':'status?logs=0');
+    if (document.hidden) return;
     $('stop').hidden = s.busy !== true;
     if (!s.readings && s.firmware) {
       currentStatus = {...currentStatus, firmware:s.firmware, wifiConnected:s.wifiConnected, ble:null, bleSuspended:true, bleConnected:false, bleReady:false};
@@ -628,26 +725,25 @@ async function poll() {
       return;
     }
     currentStatus=s;lastReadingAt=performance.now();
-    $('connection').textContent=s.ble?.enabled===false?'BLE 無効':s.bleSuspended?'BLE 一時停止':s.bleReady?'BLE 操作可能':s.bleConnected?'BLE 接続準備中':'BLE 未接続';
-    $('connection').className='badge '+(s.bleReady?'good':'warn');
+    setText('connection',s.ble?.enabled===false?'BLE 無効':s.bleSuspended?'BLE 一時停止':s.bleReady?'BLE 操作可能':s.bleConnected?(s.ble?.encrypted?'BLE キー通知待ち':'BLE 接続準備中'):'BLE 未接続');
+    const connectionClass='badge '+(s.bleReady?'good':'warn');
+    if ($('connection').className!==connectionClass) $('connection').className=connectionClass;
     renderInputMode();
-    $('output-state').textContent=s.outputEnabled?'キー送信 ON':'キー送信 OFF';$('output-state').className='badge '+(s.outputEnabled?'good':'warn');
-    for(let i=0;i<2;i++){
-      const r=s.readings[i];$('reading-button-'+i).textContent=r.button;
-      $('metric-'+i+'-0').textContent=Math.round(r.adc).toLocaleString();$('metric-'+i+'-1').textContent=Math.round(r.mv).toLocaleString();
-      $('metric-'+i+'-2').textContent=r.ohm===null?'測定不可':r.ohm.toLocaleString(undefined,{maximumFractionDigits:1});
-      $('reading-detail-'+i).textContent='生ADC '+r.raw+' · 判定単位 '+channelUnit(r.mode)+' · 参考プリセットは実車で校正してください';
-      histories[i].push(r.mv);if(histories[i].length>150)histories[i].shift();drawChart(i);
+    setText('output-state', !s.outputEnabled?'キー送信 OFF':s.inputModePaused?'キー送信 一時停止':'キー送信 ON');
+    const outputClass='badge '+(s.outputEnabled&&!s.inputModePaused?'good':'warn');
+    if ($('output-state').className!==outputClass) $('output-state').className=outputClass;
+    if (activeTab==='settings') {
+      renderLiveStatus(s.readings,lastReadingAt);
+      if ($('operation-log').open) renderOperationLogs(s);
     }
-    $('network-status').textContent=(s.wifiConnected?'Wi-Fi '+s.ip+' / '+s.rssi+' dBm':'既存Wi-Fi 未接続')+(s.apActive?' · 設定用AP '+s.apName+' / '+s.apIp:'')+' · 稼働 '+Math.floor(s.uptimeMs/1000)+'秒 · 空きRAM '+Math.round(s.freeHeap/1024)+'KB';
-    wifiStatus(s);
-    renderFirmware(s);
-    renderBle(s);
-    $('learn-status').textContent=s.learning.active?'学習中：キー送信を停止しています。残り '+(s.learning.remainingMs/1000).toFixed(1)+'秒':s.busy?'マクロ送信中':'入力監視中';
-    $('logs').replaceChildren(...s.logs.slice().reverse().map(log=>el('li',{},el('time',{},(log.at/1000).toFixed(1)+'s'),log.message)));
-    renderLearning();
+    if (lastSettingsAt===-Infinity || (activeTab==='settings' && (force || lastReadingAt-lastSettingsAt>=1000))) {
+      wifiStatus(s);
+      renderFirmware(s);
+      renderBle(s);
+      lastSettingsAt=lastReadingAt;
+    }
   }catch(error){$('stop').hidden=true;renderBle();if(csrf){$('connection').textContent='本体との通信待ち';$('connection').className='badge warn';$('wifi-connection-state').textContent='本体との通信を待っています。Wi-Fiの接続先を確認してください。';$('wifi-connection-state').className='connection-state error';}}
-  finally{polling=false; renderLearning();}
+  finally{polling=false; if (!document.hidden) renderLearning();schedulePoll();}
 }
 async function run(fn) { try{await fn();}catch(error){note(error.message,true);} }
 function validateLocal() {
@@ -660,8 +756,8 @@ function validateLocal() {
 }
 $('retry-connection').addEventListener('click',connectWorkspace);
 if (isTouchEditor) {
-  $('field-keyboard').addEventListener('pointerdown', event => event.preventDefault());
-  $('field-keyboard').addEventListener('mousedown', event => event.preventDefault());
+  fieldKeyboard.addEventListener('pointerdown', event => event.preventDefault());
+  fieldKeyboard.addEventListener('mousedown', event => event.preventDefault());
   window.visualViewport?.addEventListener('resize', showFieldKeyboard);
   document.addEventListener('focusin', () => {
     clearTimeout(focusTimer);
@@ -673,19 +769,30 @@ if (isTouchEditor) {
     focusTimer = setTimeout(checkInputFocus, 250);
   });
 }
-document.addEventListener('visibilitychange', checkInputFocus);
+document.addEventListener('visibilitychange', () => {
+  checkInputFocus();
+  if (document.hidden) clearTimeout(pollTimer); else poll();
+});
 window.addEventListener('pagehide', () => {
   clearTimeout(focusTimer);
+  clearTimeout(pollTimer);
   updateFieldKeyboard(null);
   setInputFocus(false);
 });
-window.addEventListener('pageshow', checkInputFocus);
+window.addEventListener('pageshow', () => {checkInputFocus();poll();});
 $('close-learn').addEventListener('click',()=> $('learn-dialog').close());
 $('learn-dialog').addEventListener('close',()=>{
   learningButton = null;
   checkInputFocus();
 });
-for(const button of document.querySelectorAll('nav button'))button.addEventListener('click',()=>{activeTab=button.dataset.tab;for(const b of document.querySelectorAll('nav button'))b.classList.toggle('selected',b===button);for(const section of document.querySelectorAll('[id^="tab-"]'))section.hidden=section.id!=='tab-'+activeTab;for(let i=0;i<2;i++)drawChart(i);});
+for(const button of document.querySelectorAll('nav button'))button.addEventListener('click',()=>{
+  activeTab=button.dataset.tab;
+  for(const b of document.querySelectorAll('nav button'))b.classList.toggle('selected',b===button);
+  for(const section of document.querySelectorAll('[id^="tab-"]'))section.hidden=section.id!=='tab-'+activeTab;
+  if (activeTab==='settings') lastSettingsAt=-Infinity;
+  poll();
+});
+$('operation-log').addEventListener('toggle',()=>{if ($('operation-log').open) poll();});
 $('save').addEventListener('click',()=>run(async()=>{
   if (saving) return;
   if(currentStatus?.learning.active)throw new Error('学習完了後に保存してください。');
@@ -789,6 +896,11 @@ $('reconnect-ble').addEventListener('click',()=>run(async()=>{note((await api('b
 $('forget-ble').addEventListener('click',()=>run(async()=>{if(confirm('BLEペアリング情報を削除して再起動しますか？接続先の端末側でもデバイス登録を解除してください。'))note((await api('ble/forget','POST')).message);}));
 $('reset').addEventListener('click',()=>run(async()=>{if(!confirm('入力・Wi-Fi・端末パスコードを初期化しますか？設定用APのパスワードとBLEペアリングは維持します。'))return;const result=await api('reset','POST',{confirm:'RESET'});note(result.message);await openWorkspace();}));
 window.addEventListener('beforeunload',event=>{if(hasChanges()){event.preventDefault();event.returnValue='';}});
-window.addEventListener('resize',()=>{for(let i=0;i<2;i++)drawChart(i);});
-setInterval(poll,200);
+if ('IntersectionObserver' in window) {
+  new IntersectionObserver(([entry])=>{
+    liveMonitorVisible=entry.isIntersecting;
+    if (liveMonitorVisible) poll();
+  }).observe($('live-cards'));
+}
+window.addEventListener('resize',()=>{if (liveMonitorVisible && !document.hidden) for(let i=0;i<2;i++)drawChart(i);});
 connectWorkspace();

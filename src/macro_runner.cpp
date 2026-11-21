@@ -3,6 +3,10 @@
 namespace sw {
 bool MacroRunner::start(std::vector<Step> steps) {
   if (busy() || steps.empty() || !hidReady()) return false;
+  for (const auto& step : steps) {
+    if ((step.type == "chord" || step.type == "text") && !hidKeyboardReady()) return false;
+    if (step.type == "media" && !hidMediaReady()) return false;
+  }
   steps_ = std::move(steps); index_ = textIndex_ = 0; phase_ = 0; return true;
 }
 void MacroRunner::cancel() {
@@ -16,7 +20,8 @@ int MacroRunner::tick(uint32_t now) {
   if (index_ >= steps_.size()) { cancel(); return 1; }
   auto& s = steps_[index_];
   if (phase_ == 1 && uint32_t(now - changedAt_) >= 30) {
-    if (!releaseHid()) { cancel(); return -1; }
+    const bool released = s.type == "media" ? sendMedia(0) : sendKey(0, 0);
+    if (!released) { cancel(); return -1; }
     phase_ = 2; changedAt_ = now;
   } else if (phase_ == 2 && uint32_t(now - changedAt_) >= 30) {
     if (s.type == "text" && ++textIndex_ < s.text.size()) phase_ = 0;

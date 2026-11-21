@@ -1,37 +1,84 @@
 #include "hid.h"
+#include "ble_reconnect.h"
 namespace sw {
 HidState hidState;
 namespace {
-NimBLECharacteristic *keyboard = nullptr, *media = nullptr;
+NimBLECharacteristic *keyboard = nullptr, *media = nullptr, *bootKeyboard = nullptr, *protocolMode = nullptr;
+constexpr uint8_t bootProtocol = 0, reportProtocol = 1;
+constexpr uint16_t fastAdvertisingUnits = 32;  // 20 ms in 0.625 ms units.
+constexpr uint16_t slowAdvertisingUnits = 244; // 152.5 ms in 0.625 ms units.
+constexpr uint32_t maintenanceIntervalMs = 250;
+BleReconnectSchedule reconnect;
+uint32_t lastMaintenanceAt = 0;
+std::atomic<bool> restartAdvertising{true}, peerBonded{false};
+std::atomic<uint16_t> peerHandle{BLE_HS_CONN_HANDLE_NONE};
+void clearConnectionState() {
+  hidState.encrypted = false;
+  hidState.keyboardSubscribed = false;
+  hidState.mediaSubscribed = false;
+  hidState.bootKeyboardSubscribed = false;
+  hidState.bootMode = false;
+  hidState.reportMapRead = false;
+  peerBonded = false;
+}
+bool encryptedLink() {
+  return !hidState.suspended && hidState.connected && hidState.encrypted;
+}
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
+    peerHandle = info.getConnHandle();
     if (hidState.suspended) { server->disconnect(info.getConnHandle()); return; }
-    hidState.epoch.fetch_add(1); hidState.connected = true; hidState.encrypted = false;
-    hidState.keyboardSubscribed = false; hidState.mediaSubscribed = false;
+    clearConnectionState();
+    protocolMode->setValue(reportProtocol);
+    hidState.connected = true;
+    hidState.epoch.fetch_add(1);
     server->updateConnParams(info.getConnHandle(), 12, 24, 0, 400);
     NimBLEDevice::startSecurity(info.getConnHandle());
   }
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
-    hidState.connected = false; hidState.encrypted = false;
-    hidState.keyboardSubscribed = false; hidState.mediaSubscribed = false;
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+    hidState.connected = false;
+    clearConnectionState();
+    hidState.disconnectReason = reason;
     hidState.epoch.fetch_add(1);
-    if (!hidState.suspended) NimBLEDevice::startAdvertising();
+    restartAdvertising = true;
+    peerHandle = BLE_HS_CONN_HANDLE_NONE;
   }
   void onAuthenticationComplete(NimBLEConnInfo& info) override {
     if (hidState.suspended) { NimBLEDevice::getServer()->disconnect(info.getConnHandle()); return; }
+    peerBonded = info.isBonded();
     hidState.encrypted = info.isEncrypted();
     if (!info.isEncrypted()) NimBLEDevice::getServer()->disconnect(info.getConnHandle());
   }
 } serverCallbacks;
 class ReportCallbacks : public NimBLECharacteristicCallbacks {
-  bool media_;
+  std::atomic<bool>& subscribed_;
  public:
-  explicit ReportCallbacks(bool m) : media_(m) {}
+  explicit ReportCallbacks(std::atomic<bool>& subscribed) : subscribed_(subscribed) {}
   void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t value) override {
-    if (media_) hidState.mediaSubscribed = (value & 1) != 0;
-    else hidState.keyboardSubscribed = (value & 1) != 0;
+    subscribed_ = (value & 1) != 0;
   }
-} keyCallbacks(false), mediaCallbacks(true);
+} keyCallbacks(hidState.keyboardSubscribed), mediaCallbacks(hidState.mediaSubscribed),
+  bootKeyCallbacks(hidState.bootKeyboardSubscribed);
+class ProtocolCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& info) override {
+    const auto value = characteristic->getValue();
+    if (!info.isEncrypted() || value.size() != 1 || (value[0] != bootProtocol && value[0] != reportProtocol)) {
+      characteristic->setValue(hidState.bootMode ? bootProtocol : reportProtocol);
+      return;
+    }
+    const bool boot = value[0] == bootProtocol;
+    if (hidState.bootMode.exchange(boot) != boot) hidState.epoch.fetch_add(1);
+  }
+} protocolCallbacks;
+class ReportMapCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic*, NimBLEConnInfo&) override { hidState.reportMapRead = true; }
+} reportMapCallbacks;
+
+NimBLECharacteristic* readyKeyboard() {
+  if (!encryptedLink()) return nullptr;
+  if (hidState.bootMode) return hidState.bootKeyboardSubscribed ? bootKeyboard : nullptr;
+  return hidState.keyboardSubscribed ? keyboard : nullptr;
+}
 // Standard boot-compatible keyboard and 16-bit Consumer Control reports.
 uint8_t reportMap[] = {
   0x05,0x01,0x09,0x06,0xA1,0x01,0x85,0x01,
@@ -52,19 +99,32 @@ bool beginHid(const std::string& name) {
   NimBLEHIDDevice hid(server);
   hid.setManufacturer("Steering Switch");
   hid.setPnp(0x02, 0, 0, 0x0100);
-  hid.setHidInfo(0, 1);
+  hid.setHidInfo(0, 3); // Remote Wake and Normally Connectable.
   hid.setBatteryLevel(100);
   hid.setReportMap(reportMap, sizeof(reportMap));
   keyboard = hid.getInputReport(1); media = hid.getInputReport(2);
   hid.getOutputReport(1);
+  auto service = hid.getHidService();
+  bootKeyboard = service->createCharacteristic("2a22", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY);
+  auto bootOutput = service->createCharacteristic("2a32", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
+  protocolMode = hid.getProtocolMode();
+  bootKeyboard->setCallbacks(&bootKeyCallbacks);
+  protocolMode->setCallbacks(&protocolCallbacks);
+  service->getCharacteristic("2a4b")->setCallbacks(&reportMapCallbacks);
   keyboard->setCallbacks(&keyCallbacks); media->setCallbacks(&mediaCallbacks);
-  uint8_t zeros[8] = {}; keyboard->setValue(zeros, 8); media->setValue(zeros, 2);
-  server->start();
+  uint8_t zeros[8] = {};
+  keyboard->setValue(zeros, 8); media->setValue(zeros, 2);
+  bootKeyboard->setValue(zeros, 8); bootOutput->setValue(zeros, 1);
+  if (!server->start()) return false;
   auto advertising = NimBLEDevice::getAdvertising();
   advertising->setAppearance(HID_KEYBOARD); advertising->addServiceUUID(hid.getHidService()->getUUID());
   advertising->enableScanResponse(true);
   advertising->setName(name);
-  if (!hidState.suspended) advertising->start();
+  reconnect.resetRecovery();
+  restartAdvertising = true;
+  lastMaintenanceAt = millis() - maintenanceIntervalMs;
+  maintainHid();
   return true;
 }
 bool setHidName(const std::string& name) {
@@ -75,15 +135,22 @@ bool stopHid() {
   if (!NimBLEDevice::deinit(true)) return false;
   keyboard = nullptr;
   media = nullptr;
+  bootKeyboard = nullptr;
+  protocolMode = nullptr;
   hidState.connected = false;
-  hidState.encrypted = false;
-  hidState.keyboardSubscribed = false;
-  hidState.mediaSubscribed = false;
+  peerHandle = BLE_HS_CONN_HANDLE_NONE;
+  clearConnectionState();
   hidState.epoch.fetch_add(1);
   return true;
 }
 bool hidReady() {
-  return !hidState.suspended && hidState.connected && hidState.encrypted && hidState.keyboardSubscribed && hidState.mediaSubscribed;
+  return hidKeyboardReady() || hidMediaReady();
+}
+bool hidKeyboardReady() {
+  return readyKeyboard() != nullptr;
+}
+bool hidMediaReady() {
+  return encryptedLink() && !hidState.bootMode && hidState.mediaSubscribed;
 }
 void setHidSuspended(bool suspended) {
   if (hidState.suspended.exchange(suspended) == suspended) return;
@@ -93,23 +160,64 @@ void setHidSuspended(bool suspended) {
   if (suspended) {
     NimBLEDevice::stopAdvertising();
     for (auto handle : server->getPeerDevices()) server->disconnect(handle);
-  } else if (!server->getConnectedCount()) NimBLEDevice::startAdvertising();
+  } else {
+    reconnect.resetRecovery();
+    restartAdvertising = true;
+    lastMaintenanceAt = millis() - maintenanceIntervalMs;
+  }
 }
+void maintainHid() {
+  const uint32_t now = millis();
+  if (now - lastMaintenanceAt < maintenanceIntervalMs || !NimBLEDevice::isInitialized()) return;
+  lastMaintenanceAt = now;
+  auto advertising = NimBLEDevice::getAdvertising();
+  if (hidState.suspended) {
+    if (advertising->isAdvertising()) advertising->stop();
+    return;
+  }
+  if (restartAdvertising.exchange(false)) reconnect.disconnected();
+  const uint16_t handle = peerHandle;
+  if (handle != BLE_HS_CONN_HANDLE_NONE) {
+    const bool ready = hidReady();
+    const bool awaitingReports = !ready && peerBonded && hidState.encrypted;
+    const auto action = reconnect.update(now, ready, awaitingReports);
+    if (action == BleRecoveryAction::None || peerHandle != handle || hidReady()) return;
+    auto server = NimBLEDevice::getServer();
+    if (action == BleRecoveryAction::RefreshServices) {
+      server->sendServiceChangedIndication();
+      ++hidState.serviceRefreshes;
+    } else if (server->disconnect(handle)) {
+      hidState.automaticReconnects.fetch_add(1);
+    }
+    return;
+  }
+  if (advertising->isAdvertising()) return;
+  const bool fast = reconnect.fastAdvertising();
+  const uint16_t interval = fast ? fastAdvertisingUnits : slowAdvertisingUnits;
+  advertising->setAdvertisingInterval(interval);
+  if (advertising->start(fast ? BleReconnectSchedule::fastAdvertisingMs : 0)) {
+    hidState.advertisingIntervalUnits = interval;
+    reconnect.advertisingStarted();
+  }
+}
+bool hidAutomaticRetryUsed() { return reconnect.retryUsed(); }
 bool sendKey(uint8_t key, uint8_t modifiers) {
-  if (!hidReady()) return false;
+  auto reportCharacteristic = readyKeyboard();
+  if (!reportCharacteristic) return false;
   uint8_t report[8] = {modifiers, 0, key, 0, 0, 0, 0, 0};
-  keyboard->setValue(report, sizeof(report)); return keyboard->notify();
+  reportCharacteristic->setValue(report, sizeof(report)); return reportCharacteristic->notify();
 }
 bool sendMedia(uint16_t usage) {
-  if (!hidReady()) return false;
+  if (!hidMediaReady()) return false;
   uint8_t report[2] = {uint8_t(usage & 0xff), uint8_t(usage >> 8)};
   media->setValue(report, sizeof(report)); return media->notify();
 }
-bool releaseHid() {
+void releaseHid() {
   uint8_t report[8] = {};
-  if (!keyboard || !media) return false;
+  if (!keyboard || !media || !bootKeyboard) return;
   keyboard->setValue(report, 8); media->setValue(report, 2);
-  if (!hidReady()) return false;
-  bool a = keyboard->notify(), b = media->notify(); return a && b;
+  bootKeyboard->setValue(report, 8);
+  if (auto reportCharacteristic = readyKeyboard()) reportCharacteristic->notify();
+  if (hidMediaReady()) media->notify();
 }
 } // namespace sw

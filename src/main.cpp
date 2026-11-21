@@ -25,7 +25,7 @@ constexpr uint32_t inputModeTimeoutMs = 15000;
 uint32_t rebootAt = 0;
 uint32_t firmwareBootAt = 0;
 uint32_t lastHidResumeAt = 0;
-bool verifyFirmware = false, otaOutputPaused = false, inputModePaused = false, bleEnabled = true;
+bool verifyFirmware = false, otaOutputPaused = false, bleEnabled = true;
 uint32_t lastApAttempt = 0;
 bool apStarted = false, mdnsStarted = false, wasConnected = false, networkChanged = false;
 NetworkSchedule networkSchedule;
@@ -36,20 +36,10 @@ unsigned wifiAttempts = 0;
 String announcedIp;
 void headers();
 
-void applyInputMode(bool enabled) {
-  inputModePaused = enabled;
-  enabled = enabled || otaOutputPaused || !bleEnabled;
-  if (hidState.suspended.load() == enabled) return;
-  if (enabled) runtime.cancel();
-  setHidSuspended(enabled);
-  runtime.log(!enabled ? "Bluetoothの再接続を待っています" : !bleEnabled ? "Bluetoothを設定で停止しました" :
-              otaOutputPaused ? "更新のためBluetoothを一時停止しました" : "文字入力のためBluetoothを一時停止しました");
-}
-
 bool pauseHidForFirmware() {
   if (otaOutputPaused) return true;
   otaOutputPaused = runtime.stopHidForFirmware();
-  if (!otaOutputPaused) applyInputMode(inputModePaused);
+  if (!otaOutputPaused) setHidSuspended(!bleEnabled);
   return otaOutputPaused;
 }
 
@@ -216,7 +206,7 @@ void setupRoutes() {
       jsonResponse(d);
       return;
     }
-    runtime.status(d.as<JsonObject>());
+    runtime.status(d.as<JsonObject>(), server.arg("logs") != "0");
     networkStatus(d.as<JsonObject>());
     d["apActive"] = apStarted && WiFi.AP.started(); d["apName"] = apName;
     d["apIp"] = WiFi.softAPIP().toString(); d["freeHeap"] = ESP.getFreeHeap(); jsonResponse(d);
@@ -252,10 +242,13 @@ void setupRoutes() {
     if (!saveConfig(c, error)) { response(507, error); return; }
     runtime.apply(c);
     bleEnabled = c.ble.enabled;
-    if (c.ble.name != old.ble.name && !runtime.reconnectHid(inputModePaused)) {
+    if (c.ble.name != old.ble.name && !runtime.reconnectHid()) {
       response(200, "設定は保存済みです。Bluetooth名を適用するため、本体を再起動してください"); return;
     }
-    applyInputMode(inputModePaused);
+    setHidSuspended(!bleEnabled);
+    if (c.ble.enabled != old.ble.enabled) {
+      runtime.log(bleEnabled ? "Bluetoothの再接続を待っています" : "Bluetoothを設定で停止しました");
+    }
     response(200, "設定を保存・適用しました");
   };
   server.on("/api/config", HTTP_PUT, save);
@@ -310,10 +303,10 @@ void setupRoutes() {
     if (enabled) {
       inputModeClient = client;
       inputModeUpdatedAt = millis();
-      applyInputMode(true);
+      runtime.setInputMode(true);
     } else if (client.isEmpty() || client == inputModeClient) {
       inputModeClient = "";
-      applyInputMode(false);
+      runtime.setInputMode(false);
     }
     response(200, "文字入力の状態を更新しました");
   });
@@ -368,10 +361,10 @@ void setupRoutes() {
   });
   server.on("/api/ble/reconnect", HTTP_POST, [] {
     if (!allowRequest(true)) return;
-    if (!bleEnabled || inputModePaused || rebootAt) {
-      response(409, "Bluetoothを有効にし、一時停止が解除されてから再接続してください"); return;
+    if (!bleEnabled || rebootAt) {
+      response(409, "Bluetoothを有効にし、再起動中は完了してから再接続してください"); return;
     }
-    if (!runtime.reconnectHid(false)) { response(503, "Bluetoothの再接続を開始できませんでした"); return; }
+    if (!runtime.reconnectHid()) { response(503, "Bluetoothの再接続を開始できませんでした"); return; }
     runtime.log("Bluetoothの再接続を待っています");
     response(200, "Bluetoothを再接続できる状態にしました");
   });
@@ -471,6 +464,7 @@ void setup() {
   connectNetwork(); setupRoutes();
 }
 void loop() {
+  if (!rebootAt) maintainHid();
   server.handleClient(); updateNetwork(); serialCommand();
   portalDns.processNextRequest();
   if ((!apStarted || !WiFi.AP.started()) && millis() - lastApAttempt >= 2000) {
@@ -478,7 +472,7 @@ void loop() {
   }
   if (!inputModeClient.isEmpty() && millis() - inputModeUpdatedAt >= inputModeTimeoutMs) {
     inputModeClient = "";
-    applyInputMode(false);
+    runtime.setInputMode(false);
   }
   if (setupButton.update(millis(), digitalRead(0) == LOW)) {
     startAP();
@@ -494,7 +488,7 @@ void loop() {
     lastHidResumeAt = millis();
     if (runtime.resumeHidAfterFirmware()) {
       otaOutputPaused = false;
-      applyInputMode(inputModePaused);
+      setHidSuspended(!bleEnabled);
     }
   }
   if (rebootAt && int32_t(millis() - rebootAt) >= 0) ESP.restart();

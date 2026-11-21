@@ -9,7 +9,7 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 | メソッド | パス | 入力・動作 |
 |---|---|---|
 | GET | `/api/session` | CSRFトークン取得。ログイン不要 |
-| GET | `/api/status` | 入力値、認識状態、学習状態、ログ、BLE・Wi-Fi状態 |
+| GET | `/api/status` | 入力値、認識状態、学習状態、ログ、BLE・Wi-Fi状態。`?logs=0` で操作ログを省略 |
 | POST | `/api/firmware/check` | GitHub Releasesの確認を開始。状態は `/api/status` の `firmware` で取得 |
 | POST | `/api/firmware/install` | `{"version":"1.0.1"}`。確認済みの版を取得・検証し、再起動する処理を開始 |
 | GET | `/api/config` | 現在の公開設定JSON |
@@ -21,7 +21,7 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 | POST | `/api/learn/start` | `{"channel":0}`。系統0または1を測定 |
 | POST | `/api/learn/stop` | 学習中止 |
 | POST | `/api/test` | `{"action":"macro:maps"}` で保存済み操作をテスト。`{"action":"test_digits"}` で固定の `0123456789` を送信。登録したパスコードの送信は実ボタンの長押し専用 |
-| PUT | `/api/ble/input-mode` | `{"enabled":true}` でBLE一時停止、falseで再開。設定は保存しない |
+| PUT | `/api/ble/input-mode` | `{"enabled":true}` でキー送信を一時停止、falseで再開。設定は保存しない |
 | POST | `/api/stop` | 実行中マクロを中止し、入力の再待機。送信の有効設定自体は維持 |
 | PUT | `/api/passcode` | `{"passcode":"数字列"}`。空文字で削除 |
 | PUT | `/api/wifi` | `{"ssid":"SSID","password":"Wi-Fiパスワード"}`。同じSSIDではpassword省略で登録済みの値を維持。空文字は明示的なパスワードなし、空SSIDは設定用APのみ |
@@ -37,7 +37,11 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 
 更新の確認・実行中、`/api/status` は進捗とWi-Fi接続状態のみを返します。この間はBluetoothと各種設定の更新を一時停止します。
 
-通常時の `/api/status` の `ble` に、設定名と有効状態、接続受付 `advertising`、暗号化 `encrypted`、`keyboardReady`、`mediaReady`、保存済みペアリング件数 `bonds` が含まれます。
+通常時の `/api/status` の `ble` に、設定名と有効状態、接続受付 `advertising`、暗号化 `encrypted`、`keyboardReady`、`mediaReady`、保存済みペアリング件数 `bonds` が含まれます。`bleReady` は暗号化済みの接続で少なくとも一方のキー通知を送れる状態です。操作の開始には、その操作で使うすべてのキー通知が必要です。
+
+`protocolMode` は標準の `report` またはキーボード互換の `boot` です。`reportMapRead` は今回の接続で端末がレポートマップを読み取った場合に `true` です。端末が以前の接続で読み込んだ情報を利用する場合もあります。`disconnectReason` は起動後の最後のNimBLE切断コードで、記録がなければ `0` です。`advertisingIntervalMs` は接続待ち信号を出しているときの送信間隔です。`automaticReconnects` は起動後にキー通知待ちの接続を自動で切り直した回数です。
+
+`serviceRefreshes` は起動後にサービス情報の再確認を通知した回数です。`automaticRetryUsed` は現在のキー通知待ちについて自動再試行を使ったことを示します。キー通知が可能になったときや手動で再接続したときに `false` に戻ります。
 
 設定保存・復元APIからSSIDを変更することはできません。現在のSSIDを使用し、接続先は `/api/wifi` で変更します。WebのJSON読み込みは現在のSSIDを維持し、出力をOFFにした状態で検証してから編集画面へ反映します。確認して「保存・適用」を押すまでは保存されません。
 
@@ -101,9 +105,9 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 
 ## 文字入力モード
 
-`PUT /api/ble/input-mode` に `{"enabled":true}` を送ると、実行中の操作を中止し、BLEの広告と接続を停止します。新しいBLE接続も受け付けません。`false` で広告を再開します。Web画面は `client` に16文字の識別子を添え、入力中は4秒ごとに一時停止を更新します。最後の更新から15秒で自動復帰します。識別子付きの再開要求は、直近の停止を要求した画面にだけ適用します。`/api/status` の `bleSuspended` が状態を示します。
+`PUT /api/ble/input-mode` に `{"enabled":true}` を送ると、実行中の操作を中止し、Bluetooth接続を保ったままキー送信を一時停止します。`false` で一時停止を解除します。Web画面は `client` に16文字の識別子を添え、入力中は4秒ごとに一時停止を更新します。その要求は最後の更新から15秒で期限切れになります。識別子付きの再開要求は、直近の停止を要求した画面にだけ適用します。`/api/status` の `inputModePaused` がキー送信の一時停止を示します。
 
-入力タスク・Web・学習は継続します。再開後は古い操作を再送せず、Bluetoothの再接続と安定した未押下状態を待ちます。モードはRAM上のみで、再起動すると通常のBluetooth動作に戻ります。
+入力タスク・Web・学習は継続します。解除後は安定した未押下状態を確認してから、新しい操作を受け付けます。モードはRAM上のみで、再起動すると解除されます。
 
 ## Wi-Fiの保存・接続状態
 
