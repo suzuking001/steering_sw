@@ -9,6 +9,11 @@
 namespace sw {
 constexpr int kChannels = 2, kMaxButtons = 32, kVersion = 1;
 constexpr int kIdle = -1, kUnknown = -2;
+constexpr size_t kMaxBleNameBytes = 29;
+struct BleSettings {
+  std::string name = "Steering Switch";
+  bool enabled = true;
+};
 struct Channel {
   std::string name = "KEY", mode = "adc";
   double pullup = 330, supplyMv = 3300;
@@ -30,6 +35,7 @@ struct Config {
   int version = kVersion;
   std::string name = "ステアリングスイッチ", ssid;
   bool outputEnabled = false;
+  BleSettings ble;
   Channel channels[kChannels];
   std::vector<Button> buttons;
   std::vector<Macro> macros;
@@ -88,6 +94,10 @@ inline bool validId(const std::string& s) {
 inline std::string validate(const Config& c) {
   if (c.version != kVersion) return "設定バージョンが対応していません";
   if (c.name.empty() || c.name.size() > 96 || c.ssid.size() > 32) return "設定名またはSSIDの長さが不正です";
+  if (c.ble.name.size() > kMaxBleNameBytes || c.ble.name.find_first_not_of(' ') == std::string::npos ||
+      std::any_of(c.ble.name.begin(), c.ble.name.end(), [](unsigned char ch) { return ch < 32 || ch == 127; })) {
+    return "Bluetooth名は空白だけの名前と制御文字を除き29バイトまでです";
+  }
   if (c.debounceMs < 5 || c.debounceMs > 250 || c.longMs < 400 || c.longMs > 5000 ||
       c.doubleMs < 100 || c.doubleMs > 600 || c.repeatDelayMs < 200 || c.repeatDelayMs > 3000 ||
       c.repeatMs < 50 || c.repeatMs > 1000 || c.wakeDelayMs > 10000 ||

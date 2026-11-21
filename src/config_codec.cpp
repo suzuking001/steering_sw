@@ -37,6 +37,9 @@ Config defaults() {
 }
 void toJson(const Config& c, JsonObject o) {
   o["version"] = c.version; o["name"] = c.name; o["ssid"] = c.ssid; o["outputEnabled"] = c.outputEnabled;
+  auto ble = o["ble"].to<JsonObject>();
+  ble["name"] = c.ble.name;
+  ble["enabled"] = c.ble.enabled;
   auto channels = o["channels"].to<JsonArray>();
   for (const auto& ch : c.channels) {
     auto a = channels.add<JsonObject>();
@@ -99,6 +102,9 @@ bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
       !str(in["ssid"], c.ssid, 32) || !boolean(in["outputEnabled"], c.outputEnabled)) return fail();
   // Migrate the old preset label while preserving user-defined names.
   if (c.name == "クロスビー / 汎用") c.name = Config{}.name;
+  const auto ble = in["ble"].as<JsonVariantConst>();
+  if (!ble.isUnbound() && (!ble.is<JsonObjectConst>() || !str(ble["name"], c.ble.name, kMaxBleNameBytes) ||
+                           !boolean(ble["enabled"], c.ble.enabled))) return fail();
   auto cs = in["channels"].as<JsonArrayConst>();
   if (cs.size() != kChannels) return fail();
   for (int i = 0; i < kChannels; ++i) {

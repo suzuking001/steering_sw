@@ -3,8 +3,11 @@
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <esp_ota_ops.h>
+#include <esp_tls_errors.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/x509_crt.h>
 #include <WiFi.h>
+#include <cerrno>
 #include <ctime>
 #include <memory>
 
@@ -21,6 +24,7 @@ struct Status {
   FirmwareRelease release;
   uint32_t received = 0;
   const char* message = "";
+  char detail[96] = "";
 };
 Status state;
 portMUX_TYPE stateLock = portMUX_INITIALIZER_UNLOCKED;
@@ -32,10 +36,11 @@ Status statusSnapshot() {
   return snapshot;
 }
 
-void setStage(Stage stage, const char* message = "", const FirmwareRelease* release = nullptr) {
+void setStage(Stage stage, const char* message = "", const FirmwareRelease* release = nullptr, const char* detail = "") {
   portENTER_CRITICAL(&stateLock);
   state.stage = stage;
   state.message = message;
+  snprintf(state.detail, sizeof(state.detail), "%s", detail);
   if (stage == Stage::Checking) {
     state.release = {};
     state.received = 0;
@@ -79,24 +84,38 @@ public:
     esp_http_client_config_t config{};
     config.url = url.c_str();
     config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = 8000;
+    config.buffer_size_tx = githubRequestTxBufferSize(url.length());
+    // Covers the TCP connect and the TLS handshake, which a weak 2.4GHz link can
+    // stretch past eight seconds on the first attempt.
+    config.timeout_ms = 20000;
     config.disable_auto_redirect = true;
     config.event_handler = event;
     config.user_data = this;
     client_ = esp_http_client_init(&config);
-    if (!client_) return -1;
+    if (!client_) { error_ = ESP_ERR_NO_MEM; return -1; }
+    const int scheme = url.indexOf("://");
+    const int hostStart = scheme < 0 ? 0 : scheme + 3;
+    const int hostEnd = url.indexOf('/', hostStart);
+    host_ = url.substring(hostStart, hostEnd < 0 ? url.length() : hostEnd);
     const bool apiRequest = url.startsWith(apiHost);
     if ((apiRequest && esp_http_client_set_header(client_, "X-GitHub-Api-Version", "2026-03-10") != ESP_OK) ||
         esp_http_client_set_header(client_, "User-Agent", "Steering-Switch/" SW_FIRMWARE_VERSION) != ESP_OK ||
-        esp_http_client_set_header(client_, "Accept", binary ? "application/octet-stream" : "application/vnd.github+json") != ESP_OK) return -1;
+        esp_http_client_set_header(client_, "Accept", binary ? "application/octet-stream" : "application/vnd.github+json") != ESP_OK) {
+      error_ = ESP_FAIL;
+      return -1;
+    }
     String authorization;
     if (!token.isEmpty()) {
-      if (!apiRequest) return -1;
+      if (!apiRequest) { error_ = ESP_ERR_INVALID_ARG; return -1; }
       authorization = "Bearer " + token;
       if (authorization.length() != token.length() + 7 ||
-          esp_http_client_set_header(client_, "Authorization", authorization.c_str()) != ESP_OK) return -1;
+          esp_http_client_set_header(client_, "Authorization", authorization.c_str()) != ESP_OK) { error_ = ESP_FAIL; return -1; }
     }
-    if (esp_http_client_open(client_, 0) != ESP_OK || esp_http_client_fetch_headers(client_) < 0) return -1;
+    if (esp_http_client_open(client_, 0) != ESP_OK || esp_http_client_fetch_headers(client_) < 0) {
+      error_ = esp_http_client_get_errno(client_);
+      esp_http_client_get_and_clear_last_tls_error(client_, &tlsError_, &tlsFlags_);
+      return -1;
+    }
     return esp_http_client_get_status_code(client_);
   }
 
@@ -104,6 +123,10 @@ public:
   int64_t contentLength() const { return esp_http_client_get_content_length(client_); }
   bool complete() const { return esp_http_client_is_complete_data_received(client_); }
   const String& location() const { return location_; }
+  const String& host() const { return host_; }
+  int transportError() const { return error_; }
+  int tlsError() const { return tlsError_; }
+  int tlsFlags() const { return tlsFlags_; }
 
 private:
   static esp_err_t event(esp_http_client_event_t* e) {
@@ -116,9 +139,12 @@ private:
     if (client_) esp_http_client_cleanup(client_);
     client_ = nullptr;
     location_ = "";
+    host_ = "";
+    error_ = tlsError_ = tlsFlags_ = 0;
   }
   esp_http_client_handle_t client_ = nullptr;
-  String location_;
+  String location_, host_;
+  int error_ = 0, tlsError_ = 0, tlsFlags_ = 0;
 };
 
 String releaseUrl() { return String(apiHost) + kGithubRepository + "/releases/"; }
@@ -134,6 +160,37 @@ const char* githubError(int code, bool authenticated) {
   return "GitHubと通信できませんでした。本体のインターネット接続を確認してください。";
 }
 
+// Filled by the single running worker and handed to the next setStage() call.
+char transportDetail[96];
+
+// A connect failure never reaches GitHub, so no HTTP status names it. The TLS
+// layer's own error and certificate flags are the only clues, so keep them visible.
+const char* transportFailure(const GithubResponse& response) {
+  IPAddress resolved;
+  const bool dns = WiFi.hostByName(response.host().c_str(), resolved);
+  const int status = WiFi.status();
+  const int errno_ = response.transportError(), tls = response.tlsError(), flags = response.tlsFlags();
+  Serial.printf("GitHub OTA: %s に接続できませんでした (errno=0x%x, TLS=0x%x, 証明書=%x, DNS=%s, Wi-Fi=%d, freeHeap=%u)\n",
+                response.host().c_str(), errno_, tls, flags, dns ? "成功" : "失敗", status,
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  char detail[64];
+  snprintf(detail, sizeof(detail), "errno=0x%x TLS=0x%x 証明書=%x DNS=%s 空きRAM=%uKB", errno_, tls, flags,
+           dns ? "成功" : "失敗", static_cast<unsigned>(ESP.getFreeHeap() / 1024));
+  snprintf(transportDetail, sizeof(transportDetail), "%s", detail);
+  if (!dns) return "Wi-Fi上でGitHubのドメイン名を解決できませんでした。ルーターのDNS設定とインターネット接続を確認してください。";
+  if (status != WL_CONNECTED) return "通信の途中でWi-Fiが切断されました。接続状態を確認して再試行してください。";
+  if (flags & (MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE))
+    return "本体の時刻がずれているためGitHubの証明書を受け入れられません。インターネットに接続できるWi-Fiで再試行してください。";
+  if (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED) return "GitHubの証明書を信頼済みの一覧で確認できませんでした。";
+  if (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH) return "GitHubのサーバー名が証明書と一致しませんでした。";
+  if (tls == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT || tls == ESP_ERR_ESP_TLS_SERVER_HANDSHAKE_TIMEOUT)
+    return "GitHubとの暗号通信が時間内に確立できませんでした。電波の状態の良い場所で再試行してください。";
+  if (tls == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME || tls == ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST)
+    return "GitHubのサーバー（443番ポート）に到達できませんでした。ルーターの通信制限や端末分離を確認してください。";
+  if (errno_ == ENOMEM) return "暗号通信を開始するための空きメモリーがありません。";
+  return "GitHubとHTTPS通信を確立できませんでした。画面の状態表示にある詳細を確認してください。";
+}
+
 const char* checkRelease(const String& token) {
   const auto* target = updatePartition();
   if (!target) return noPartition;
@@ -147,6 +204,7 @@ const char* checkRelease(const String& token) {
       authenticated = true;
       code = response.open(url, token, false);
     }
+    if (code < 0) return transportFailure(response);
     if (code != 200) return githubError(code, authenticated);
     if (response.contentLength() > maxMetadataBytes) return "リリース情報が大きすぎます。";
     char buffer[1024];
@@ -208,6 +266,7 @@ const char* installRelease(const String& token, const FirmwareRelease& release) 
     code = response.open(location, "", true);
     authenticated = false;
   }
+  if (code < 0) return transportFailure(response);
   if (code != 200) return githubError(code, authenticated);
   const auto length = response.contentLength();
   if (length > 0 && length != release.size) return "配布ファイルのサイズがリリース情報と一致しません。";
@@ -253,9 +312,10 @@ struct Job { String token; bool install; FirmwareRelease release; };
 void firmwareWorker(void* arg) {
   {
     const std::unique_ptr<Job> job(static_cast<Job*>(arg));
+    transportDetail[0] = '\0';
     const char* error = ensureClock() ? (job->install ? installRelease(job->token, job->release) : checkRelease(job->token)) :
                                       "時刻を取得できませんでした。インターネット接続を確認してください。";
-    if (error) setStage(Stage::Failed, error);
+    if (error) setStage(Stage::Failed, error, nullptr, transportDetail);
   }
   vTaskDelete(nullptr);
 }
@@ -303,6 +363,7 @@ void firmwareStatus(JsonObject out) {
   out["availableVersion"] = std::string(status.release.version);
   out["stage"] = names[static_cast<unsigned>(status.stage)];
   out["message"] = status.message;
+  out["detail"] = std::string(status.detail);
   out["received"] = status.received;
   out["size"] = status.release.size;
 }

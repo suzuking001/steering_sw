@@ -8,6 +8,11 @@ namespace sw {
 inline constexpr char kGithubRepository[] = "suzuking001/steering_sw";
 inline constexpr char kFirmwareAsset[] = "steering-sw-esp32dev.bin";
 
+// ESP-IDF formats the entire request line before writing any request bytes.
+inline constexpr size_t githubRequestTxBufferSize(size_t urlLength) {
+  return urlLength < 256 ? 512 : urlLength + 256;
+}
+
 struct FirmwareRelease {
   char version[16]{};
   uint64_t assetId = 0;

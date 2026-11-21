@@ -9,6 +9,21 @@
   border-radius: 8px;
 }
 
+.ble-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 14px;
+  margin: 0 0 16px;
+}
+.ble-details > div {
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--bg);
+}
+.ble-details dt { color: var(--muted); font-size: .8rem; }
+.ble-details dd { margin: 0; font-weight: 600; }
+#ble-fields + p { margin: 8px 0 0; }
+
 .field-keyboard {
   display: grid;
   gap: 5px;

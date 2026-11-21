@@ -25,7 +25,7 @@ constexpr uint32_t inputModeTimeoutMs = 15000;
 uint32_t rebootAt = 0;
 uint32_t firmwareBootAt = 0;
 uint32_t lastHidResumeAt = 0;
-bool verifyFirmware = false, otaOutputPaused = false, inputModePaused = false;
+bool verifyFirmware = false, otaOutputPaused = false, inputModePaused = false, bleEnabled = true;
 uint32_t lastApAttempt = 0;
 bool apStarted = false, mdnsStarted = false, wasConnected = false, networkChanged = false;
 NetworkSchedule networkSchedule;
@@ -38,11 +38,11 @@ void headers();
 
 void applyInputMode(bool enabled) {
   inputModePaused = enabled;
-  enabled = enabled || otaOutputPaused;
+  enabled = enabled || otaOutputPaused || !bleEnabled;
   if (hidState.suspended.load() == enabled) return;
   if (enabled) runtime.cancel();
   setHidSuspended(enabled);
-  runtime.log(!enabled ? "Bluetoothの再接続を待っています" :
+  runtime.log(!enabled ? "Bluetoothの再接続を待っています" : !bleEnabled ? "Bluetoothを設定で停止しました" :
               otaOutputPaused ? "更新のためBluetoothを一時停止しました" : "文字入力のためBluetoothを一時停止しました");
 }
 
@@ -53,13 +53,13 @@ bool pauseHidForFirmware() {
   return otaOutputPaused;
 }
 
-void printSetupInfo() {
+void printSetupInfo(const std::string& bleName) {
   Serial.println("\n=== EASY CONNECTION ===");
   Serial.printf("1. Wi-Fi: %s\n   Password: %s\n", apName.c_str(), apPassword.c_str());
   Serial.println("2. Open the setup page (or http://192.168.4.1/)");
   Serial.println("   Web page: opens directly. No Web login or password.");
   if (WiFi.status() == WL_CONNECTED) Serial.printf("   PC on the router network: http://%s/\n", WiFi.localIP().toString().c_str());
-  Serial.println("3. On your device > Settings > Bluetooth > Steering Switch");
+  Serial.printf("3. On your device > Settings > Bluetooth > %s\n", bleName.c_str());
   Serial.println("Setup Wi-Fi starts at power-on. Hold BOOT for 3 seconds to retry if needed.");
   Serial.println("=======================\n");
 }
@@ -246,10 +246,17 @@ void setupRoutes() {
     Config c; String error; std::string parseError;
     if (!fromJson(d.as<JsonVariantConst>(), c, parseError)) { response(400, parseError.c_str()); return; }
     auto old = runtime.config();
+    if (d["ble"].isUnbound()) c.ble = old.ble;
     // Wi-Fi changes use /api/wifi so credentials can never leak into backups.
     if (c.ssid != old.ssid) { response(400, "SSIDはWi-Fi設定から変更してください。復元時は現在のSSIDを使用してください"); return; }
     if (!saveConfig(c, error)) { response(507, error); return; }
-    runtime.apply(c); response(200, "設定を保存・適用しました");
+    runtime.apply(c);
+    bleEnabled = c.ble.enabled;
+    if (c.ble.name != old.ble.name && !runtime.reconnectHid(inputModePaused)) {
+      response(200, "設定は保存済みです。Bluetooth名を適用するため、本体を再起動してください"); return;
+    }
+    applyInputMode(inputModePaused);
+    response(200, "設定を保存・適用しました");
   };
   server.on("/api/config", HTTP_PUT, save);
   server.on("/api/backup", HTTP_GET, [] {
@@ -263,10 +270,13 @@ void setupRoutes() {
     JsonDocument d; if (!body(d)) return;
     Config c; std::string error;
     if (!fromJson(d.as<JsonVariantConst>(), c, error)) { response(400, error.c_str()); return; }
+    if (d["ble"].isUnbound()) c.ble = runtime.config().ble;
     JsonDocument out; toJson(c, out.to<JsonObject>()); jsonResponse(out);
   });
   server.on("/api/defaults", HTTP_GET, [] {
-    if (!allowRequest()) { return; } auto c = defaults(); c.ssid = runtime.config().ssid;
+    if (!allowRequest()) { return; }
+    const auto current = runtime.config();
+    auto c = defaults(); c.ssid = current.ssid; c.ble = current.ble;
     JsonDocument d; toJson(c, d.to<JsonObject>()); jsonResponse(d);
   });
   server.on("/api/learn/start", HTTP_POST, [] {
@@ -349,11 +359,21 @@ void setupRoutes() {
     if (!allowRequest(true)) { return; } JsonDocument d; if (!body(d, 128)) return;
     if (d["confirm"].as<String>() != "RESET") { response(400, "初期化の確認文字が不正です"); return; }
     auto c = defaults(); String error;
+    c.ble = runtime.config().ble;
     if (!saveConfig(c, error)) { response(507, error); return; }
     runtime.apply(c);
     bool ok = saveSecret("passcode", "") && saveSecret("wifi", "");
     runtime.setPasscode(""); wifiPassword = ""; networkChanged = true;
     response(ok ? 200 : 507, ok ? "入力・Wi-Fi・パスコード設定を初期化しました。設定用APのパスワードとBLEペアリングは維持します" : "設定は初期化しましたが秘密情報の削除に失敗しました。再度初期化してください");
+  });
+  server.on("/api/ble/reconnect", HTTP_POST, [] {
+    if (!allowRequest(true)) return;
+    if (!bleEnabled || inputModePaused || rebootAt) {
+      response(409, "Bluetoothを有効にし、一時停止が解除されてから再接続してください"); return;
+    }
+    if (!runtime.reconnectHid(false)) { response(503, "Bluetoothの再接続を開始できませんでした"); return; }
+    runtime.log("Bluetoothの再接続を待っています");
+    response(200, "Bluetoothを再接続できる状態にしました");
   });
   server.on("/api/ble/forget", HTTP_POST, [] {
     if (!allowRequest(true)) { return; } runtime.cancel();
@@ -389,7 +409,7 @@ void serialCommand() {
       line.trim();
       // Keep older USB commands as harmless aliases for the connection guide.
       if (line == "SETUP" || line == "EASY_SETUP" || line == "RESET_ADMIN") {
-        startAP(); printSetupInfo();
+        startAP(); printSetupInfo(runtime.config().ble.name);
       }
       if (line == "HELP") {
         Serial.println("SETUP: show/start setup Wi-Fi; GITHUB_TOKEN <fine-grained PAT>: save read-only release access; GITHUB_TOKEN_CLEAR: remove it; HELP");
@@ -432,8 +452,10 @@ void setup() {
   apName = "SteeringSW-" + String(uint32_t(ESP.getEfuseMac() >> 24) & 0xFFFFFF, HEX);
   webCsrf = randomHex(24);
   Serial.println("Steering Switch / 115200 baud. HELP for serial commands.");
-  printSetupInfo();
-  if (!beginHid()) fatalStartup("FATAL: Cannot start Bluetooth.");
+  printSetupInfo(c.ble.name);
+  bleEnabled = c.ble.enabled;
+  hidState.suspended = !bleEnabled;
+  if (!beginHid(c.ble.name)) fatalStartup("FATAL: Cannot start Bluetooth.");
   if (!runtime.begin(c, passcode)) fatalStartup("FATAL: Cannot start input task.");
   runtime.log(restored ? "保存設定を復元しました" : "参考プリセットで開始。校正後に送信を有効にしてください");
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {

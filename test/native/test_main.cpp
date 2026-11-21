@@ -116,8 +116,35 @@ int main(int argc,char** argv) {
     require(isGithubToken("github_pat_fixture123") && !isGithubToken("ghp_fixture123") && !isGithubToken("github_pat_abc\r\n"),
             "token format validation failed");
   });
+  test("OTA reserves enough send buffer for a signed GitHub download URL",[]{
+    require(githubRequestTxBufferSize(80)==512,"short URLs grew the default buffer");
+    const std::string url = "https://release-assets.githubusercontent.com/path?sig=" + std::string(900, 'a');
+    const auto requestBytes = std::string("GET ").size() + url.size() + std::string(" HTTP/1.1\r\n").size();
+    require(isGithubAssetRedirect(url) && githubRequestTxBufferSize(url.size())>requestBytes,"signed URL would overflow the send buffer");
+  });
   test("reference preset is valid and output is disabled",[]{auto c=defaults();require(validate(c).empty(),"invalid defaults");require(!c.outputEnabled,"unexpected output");require(c.buttons.size()==9,"button count");});
   test("JSON round trip preserves configuration",[]{auto c=defaults();c.name="別の車";c.channels[0].pullup=470;JsonDocument d;toJson(c,d.to<JsonObject>());Config out;std::string err;require(fromJson(d.as<JsonVariantConst>(),out,err),err.c_str());require(out.name==c.name&&out.channels[0].pullup==470,"lost fields");});
+  test("Bluetooth settings preserve defaults for old backups and validate stored names",[]{
+    auto c=defaults();
+    JsonDocument d;
+    toJson(c,d.to<JsonObject>());
+    Config out;
+    std::string error;
+    auto decode=[&]{return fromJson(d.as<JsonVariantConst>(),out,error);};
+    d.remove("ble");
+    require(decode() && out.ble.enabled && out.ble.name==c.ble.name,"legacy defaults lost");
+    d["ble"]["name"]="運転席 Steering";
+    d["ble"]["enabled"]=false;
+    require(decode() && !out.ble.enabled && out.ble.name=="運転席 Steering","changed Bluetooth settings not read");
+    d["ble"]["name"]=std::string(kMaxBleNameBytes+1,'a');
+    require(!decode(),"oversized advertising name accepted");
+    d["ble"]["name"]="bad\nname";
+    require(!decode(),"control character accepted");
+    d["ble"]["name"]="   ";
+    require(!decode(),"blank advertising name accepted");
+    d["ble"]=nullptr;
+    require(!decode(),"null Bluetooth settings accepted");
+  });
   test("legacy input units and thresholds survive loading",[]{
     auto c=defaults();
     c.name="クロスビー / 汎用";

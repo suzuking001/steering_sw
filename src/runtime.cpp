@@ -39,7 +39,16 @@ bool Runtime::stopHidForFirmware() {
 }
 bool Runtime::resumeHidAfterFirmware() {
   Guard lock(mutex_);
-  return beginHid();
+  return beginHid(cfg_.ble.name);
+}
+bool Runtime::reconnectHid(bool suspended) {
+  Guard lock(mutex_);
+  runner_.cancel();
+  resetEngines();
+  setHidSuspended(true);
+  const bool named = setHidName(cfg_.ble.name);
+  setHidSuspended(suspended || !cfg_.ble.enabled);
+  return named;
 }
 void Runtime::resetEngines() {
   for (auto& engine : engines_) engine.reset();
@@ -63,6 +72,7 @@ void Runtime::setPasscode(const String& passcode) {
 bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool physical, String& error) {
   if (action == "none") return true;
   if (!cfg_.outputEnabled) { error = "キー送信が無効です"; return false; }
+  if (!cfg_.ble.enabled) { error = "Bluetoothが無効です"; return false; }
   if (learning_.active) { error = "学習中は送信できません"; return false; }
   if (hidState.suspended) { error = "文字入力モード中は接続先の端末操作を停止しています"; return false; }
   if (!hidReady()) { error = "BLEが操作可能な状態ではありません"; return false; }
@@ -75,6 +85,8 @@ bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool phys
     if (cfg_.wakeSpace) steps.push_back(chord(44, 0));
     Step wait; wait.type = "wait"; wait.ms = cfg_.wakeDelayMs; steps.push_back(wait);
     Step text; text.type = "text"; text.text = passcode_.c_str(); steps.push_back(text);
+  } else if (action == "test_digits") {
+    Step text; text.type = "text"; text.text = "0123456789"; steps.push_back(text);
   } else if (action == "home") steps.push_back(chord(11, 8));
   else if (action == "switch_app") steps.push_back(chord(43, 8));
   else {
@@ -97,7 +109,9 @@ bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool phys
 }
 bool Runtime::test(const std::string& action, String& error) {
   Guard lock(mutex_);
-  if (!isAction(cfg_, action) || action == "passcode") { error = "テストできない操作です"; return false; }
+  if (action != "test_digits" && (!isAction(cfg_, action) || action == "passcode")) {
+    error = "テストできない操作です"; return false;
+  }
   return actionLocked(action, Gesture::Short, false, error);
 }
 void Runtime::cancel() { Guard lock(mutex_); runner_.cancel(); resetEngines(); logLocked("操作を停止しました"); }
@@ -119,7 +133,7 @@ void Runtime::tick() {
   int accMv = analogReadMilliVolts(accPin);
   Guard lock(mutex_);
   const uint32_t now = millis(); ++samples_; accMv_ = accMv;
-  const bool ready = hidReady(); const uint32_t epoch = hidState.epoch;
+  const bool ready = cfg_.ble.enabled && hidReady(); const uint32_t epoch = hidState.epoch;
   if (ready != ready_ || epoch != hidEpoch_) {
     runner_.cancel(); resetEngines(); hidEpoch_ = epoch; ready_ = ready;
     logLocked(ready ? "BLE操作可能。全キーを解放して未押下を待ちます" : "BLE待機中。保留操作を破棄しました");
@@ -174,6 +188,19 @@ void Runtime::status(JsonObject o) {
   o["uptimeMs"] = millis(); o["samples"] = samples_; o["outputEnabled"] = cfg_.outputEnabled;
   o["bleConnected"] = hidState.connected.load(); o["bleReady"] = hidReady(); o["busy"] = runner_.busy();
   o["bleSuspended"] = hidState.suspended.load();
+  auto ble = o["ble"].to<JsonObject>();
+  ble["name"] = cfg_.ble.name;
+  ble["enabled"] = cfg_.ble.enabled;
+  ble["encrypted"] = hidState.encrypted.load();
+  ble["keyboardReady"] = hidState.keyboardSubscribed.load();
+  ble["mediaReady"] = hidState.mediaSubscribed.load();
+  if (NimBLEDevice::isInitialized()) {
+    ble["advertising"] = NimBLEDevice::getAdvertising()->isAdvertising();
+    ble["bonds"] = NimBLEDevice::getNumBonds();
+  } else {
+    ble["advertising"] = false;
+    ble["bonds"] = nullptr;
+  }
   o["passcodeSet"] = !passcode_.isEmpty(); o["accMv"] = accMv_;
   auto rs = o["readings"].to<JsonArray>();
   for (int i = 0; i < kChannels; ++i) {

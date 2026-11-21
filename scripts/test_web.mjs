@@ -15,6 +15,7 @@ let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,r
 const savedWifiRequests=[],saveOrder=[];
 let state=fixture(),learning=null,learningAt=0,passcodeSet=false,testedActions=[];
 let macroBusy=false, stopRequests=0;
+let bleAttached=true, bleEncrypted=true, bleReconnectRequests=0;
 let key2Millivolts=2750;
 const firmware={repository:'suzuking001/steering_sw',version:'1.0.1',availableVersion:'',stage:'idle',tokenSet:false,received:0,size:0,message:'',bootChecking:false};
 const firmwareRequests=[];
@@ -39,7 +40,9 @@ const server=http.createServer(async(req,res)=>{
         reply(200,{firmware,wifiConnected:wifiState==='connected'});return;
       }
       const done=learning&&Date.now()-learningAt>400;
-      reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:!bleSuspended,bleReady:!bleSuspended,bleSuspended,busy:macroBusy,passcodeSet,accMv:2000,
+      const paused=bleSuspended||!state.ble.enabled, connected=bleAttached&&!paused;
+      const ble={...state.ble,advertising:!paused&&!connected,encrypted:connected&&bleEncrypted,keyboardReady:connected,mediaReady:connected&&bleEncrypted,bonds:1};
+      reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:connected&&bleEncrypted,bleSuspended:paused,ble,busy:macroBusy,passcodeSet,accMv:2000,
         readings:state.channels.map((c,i)=>({name:c.name,mode:c.mode,pin:[36,39][i],raw:3890,adc:3890,mv:i===0?3050:key2Millivolts,ohm:i===0?5211:5187,button:'未押下',buttonId:null})),
         firmware,learning:{active:!!learning&&!done,done:!!done,channel:learning?.channel||0,count:400,error:'',remainingMs:done?0:200,center:3895,minimum:3890,maximum:3900,tolerance:15},
         wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]});return;
@@ -54,7 +57,10 @@ const server=http.createServer(async(req,res)=>{
     }
     if(path==='learn/start'){learning={channel:body.channel};learningAt=Date.now();reply(200,{message:'学習開始'});return;}
     if(path==='learn/stop'){learning=null;reply(200,{message:'学習中止'});return;}
-    if(path==='test'){testedActions.push(body.action);reply(200,{message:'テストを開始しました'});return;}
+    if(path==='test'){
+      if(body.action==='passcode'){reply(409,{error:'テストできない操作です'});return;}
+      testedActions.push(body.action);reply(200,{message:'テストを開始しました'});return;
+    }
     if(path==='firmware/check'){
       if(wifiState!=='connected'){reply(409,{error:'更新できません'});return;}
       firmwareRequests.push(path);firmware.stage='checking';reply(202,{message:'更新確認を開始'});return;
@@ -67,6 +73,10 @@ const server=http.createServer(async(req,res)=>{
       inputModeRequests.push(body);
       if(delayInputMode && body.enabled)await new Promise(resolve=>setTimeout(resolve,400));
       bleSuspended=body.enabled;reply(200,{message:'文字入力の状態を更新しました'});return;
+    }
+    if(path==='ble/reconnect'){
+      if(!state.ble.enabled||bleSuspended){reply(409,{error:'Bluetoothを有効にしてください'});return;}
+      bleReconnectRequests++;bleAttached=false;reply(200,{message:'Bluetoothの再接続を待っています'});return;
     }
     if(path==='passcode'){if(rejectNextPin){rejectNextPin=false;reply(507,{error:'保存できませんでした'});return;}saveOrder.push('passcode');passcodeSet=!!body.passcode;reply(200,{message:'パスコード更新'});return;}
     if(path==='wifi'){if(body.ssid&&body.ssid!==state.ssid&&!Object.hasOwn(body,'password')){reply(400,{error:'新しいWi-Fiのパスワードを入力してください'});return;}savedWifiRequests.push(body);saveOrder.push('wifi');state.ssid=body.ssid;if(Object.hasOwn(body,'password'))wifiPasswordSet=!!body.password;wifiState=state.ssid?'connecting':'unconfigured';wifiAttempts=1;reply(200,{message:'Wi-Fi設定保存'});return;}
@@ -109,6 +119,24 @@ try{
   check(stopStartsHidden && stopRequests===1 && !macroBusy,'the stop button appears only during a send and cancels it');
   await evaluate(`document.querySelector('[data-tab="settings"]').click()`);
   check(await evaluate('document.getElementById("metric-0-0").textContent==="3,890" && [...document.querySelectorAll("#live-cards canvas")].every(chart=>chart.width>300)'),'two live charts are drawn in settings');
+  bleEncrypted=false;
+  await wait('document.getElementById("ble-state").textContent==="接続準備中"');
+  check(await evaluate(`document.getElementById('ble-encryption').textContent==='準備中' &&
+    document.getElementById('ble-keyboard').textContent==='使用可能' && document.getElementById('ble-paired').textContent==='1台'`),
+    'Bluetooth panel distinguishes the link, security, key services and saved pairings');
+  await evaluate(`document.getElementById('reconnect-ble').click()`);
+  await wait('document.getElementById("ble-advertising").textContent==="受付中"');
+  check(bleReconnectRequests===1 && await evaluate('document.getElementById("ble-paired").textContent==="1台"'),
+    'Bluetooth reconnect returns to advertising while retaining saved pairings');
+  await evaluate(`fill('#ble-fields','端末に表示されるBluetooth名','運転席 Steering');document.getElementById('ble-enabled-input').click();
+    document.getElementById('save').click();`);
+  await wait('!dirty && document.getElementById("ble-state").textContent==="無効"');
+  check(state.ble.name==='運転席 Steering' && !state.ble.enabled && await evaluate('document.getElementById("reconnect-ble").disabled'),
+    'Bluetooth name and enable setting save through the normal footer');
+  bleAttached=bleEncrypted=true;
+  await evaluate(`fill('#ble-fields','端末に表示されるBluetooth名','Steering Switch');document.getElementById('ble-enabled-input').click();
+    document.getElementById('save').click();`);
+  await wait('!dirty && document.getElementById("ble-state").textContent==="操作可能"');
   let shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'desktop.png'),Buffer.from(shot.data,'base64'));
   await evaluate(`document.querySelector('#input-cards').closest('details').open=true;fill('#input-cards','供給電圧 mV',3200);`);
   check(await evaluate('dirty && config.channels[0].supplyMv===3200'),'circuit constants are editable without changing saved state');
@@ -137,9 +165,12 @@ try{
       const select=document.querySelectorAll(newCard+' .button-actions select')[index];
       select.value=value;select.dispatchEvent(new Event('change',{bubbles:true}));
     };`);
-  check(await evaluate(`testButtons().length===3 && testButtons().every(button=>button.disabled) &&
-    document.querySelector('[data-button-id="phone_on"] button[aria-label="長押しをテスト"]').disabled`),
-    'unassigned and passcode actions cannot be tested from cards');
+  check(await evaluate('testButtons().length===3 && testButtons().every(button=>button.disabled)'),
+    'unassigned actions cannot be tested from cards');
+  await evaluate(`document.getElementById('message').hidden=true;
+    document.querySelector('[data-button-id="phone_on"] button[aria-label="数字入力をテスト"]').click();`);
+  await wait('!document.getElementById("message").hidden && document.getElementById("message").textContent.includes("テストを開始")');
+  check(testedActions.join(',')==='test_digits','the passcode card requests the sample digits action');
   const cardActions=['play_pause','next','previous'];
   for (const [index, action] of cardActions.entries()) {
     await evaluate(`setAction(${index},${JSON.stringify(action)});document.getElementById('message').hidden=true;testButtons()[${index}].click();`);
@@ -181,7 +212,14 @@ try{
   await evaluate(`document.getElementById('save').click();`);await wait('!dirty');
   check(inputModeRequests.length===pausesBeforeIdleCapture && state.channels[0].idleCenter===3050 && state.channels[1].idleCenter===3100,
     'idle values can be saved without pausing Bluetooth');
-  await evaluate(`document.querySelector('[data-tab="macros"]').click();document.getElementById('add-macro').click();`);
+  await evaluate(`document.querySelector('[data-tab="macros"]').click();`);
+  check(await evaluate(`globalThis.macroShortcut=()=>[...document.querySelectorAll('.macro-shortcut')].map(label=>label.textContent);
+    const initial=macroShortcut();
+    fill('#macro-cards .macro-card:nth-child(2)','HIDキー番号（10進数）',30);
+    [...document.querySelectorAll('#macro-cards .macro-card:nth-child(2) .modifiers input')].slice(0,2).forEach(input=>input.click());
+    initial[0]==='送信するキー Control＋Option＋Shift＋1' && initial[1]==='送信するキー Control＋Option＋Shift＋2' &&
+    macroShortcut()[1]==='送信するキー Option＋1'`), 'preset chords reflect the actual key and modifiers');
+  await evaluate(`document.getElementById('discard').click();document.getElementById('add-macro').click();`);
   check(await evaluate('config.macros.length===6 && document.querySelectorAll(".macro-card").length===6'),'custom macros can be added');
   await evaluate(`document.getElementById('save').click()`);await wait('!dirty');
   await evaluate(`document.querySelectorAll('#macro-cards .macro-card')[0].querySelector('.actions button:last-child').click()`);

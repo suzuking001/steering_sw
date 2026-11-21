@@ -44,8 +44,8 @@ uint8_t reportMap[] = {
   0x15,0x00,0x26,0xFF,0x03,0x19,0x00,0x2A,0xFF,0x03,0x75,0x10,0x95,0x01,0x81,0x00,0xC0
 };
 }
-bool beginHid() {
-  if (!NimBLEDevice::init("Steering Switch")) return false;
+bool beginHid(const std::string& name) {
+  if (!NimBLEDevice::init(name)) return false;
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   auto server = NimBLEDevice::createServer(); server->setCallbacks(&serverCallbacks, false);
@@ -62,9 +62,13 @@ bool beginHid() {
   server->start();
   auto advertising = NimBLEDevice::getAdvertising();
   advertising->setAppearance(HID_KEYBOARD); advertising->addServiceUUID(hid.getHidService()->getUUID());
-  advertising->setName("Steering Switch"); advertising->enableScanResponse(true);
+  advertising->enableScanResponse(true);
+  advertising->setName(name);
   if (!hidState.suspended) advertising->start();
   return true;
+}
+bool setHidName(const std::string& name) {
+  return NimBLEDevice::isInitialized() && NimBLEDevice::setDeviceName(name) && NimBLEDevice::getAdvertising()->setName(name);
 }
 bool stopHid() {
   setHidSuspended(true);

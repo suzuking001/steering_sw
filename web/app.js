@@ -11,7 +11,7 @@ const inputModeClient = Array.from(crypto.getRandomValues(new Uint8Array(8)),
   byte => byte.toString(16).padStart(2, '0')).join('');
 let inputModeRequested = false, inputModeRequest = false, inputModeDesired = false;
 let focusTimer, inputModeHeartbeat;
-const keyboardFields = ['wifi-ssid', 'wifi-password', 'passcode', 'button-name-input'];
+const keyboardFields = ['wifi-ssid', 'wifi-password', 'passcode', 'button-name-input', 'ble-name-input'];
 let keyboardField, keyboardTimer, keyboardLayout;
 let messageTimer;
 const builtins = [['none','未割り当て'],['volume_up','音量＋（押し続けで連続）'],['volume_down','音量－（押し続けで連続）'],['play_pause','再生／一時停止'],['mute','消音'],['next','次の曲'],['previous','前の曲'],['home','ホーム'],['switch_app','アプリ切り替え'],['maps','Googleマップ'],['youtube','YouTube'],['siri','Siri'],['lock','画面ロック'],['app_list','アプリ一覧'],['passcode','パスコード送信（長押し専用）']];
@@ -32,8 +32,9 @@ function note(message, error = false) {
   clearTimeout(messageTimer); messageTimer = setTimeout(() => { node.hidden = true; }, error ? 14000 : 7000);
 }
 function hasChanges() { return dirty || wifiDirty || passcodeDirty; }
+function unsavedParts() { return [dirty?'本体設定':null, wifiDirty?'Wi-Fi':null, passcodeDirty?'端末パスコード':null].filter(Boolean); }
 function refreshDirty() {
-  const parts = [dirty?'本体設定':null, wifiDirty?'Wi-Fi':null, passcodeDirty?'端末パスコード':null].filter(Boolean);
+  const parts = unsavedParts();
   $('dirty-state').textContent = parts.length ? '未保存：'+parts.join('・') : '保存済み';
   $('save').disabled = saving || !parts.length;
 }
@@ -102,6 +103,10 @@ function renderAll() {
   $('device-name').textContent = config.name;
   if(!wifiDirty) $('wifi-ssid').value = config.ssid;
   renderLive(); renderInputs(); renderButtons(); renderMacros(); renderSettings();
+  $('ble-fields').replaceChildren(
+    field('端末に表示されるBluetooth名',config.ble,'name','text',{id:'ble-name-input',maxlength:29,autocomplete:'off'}),
+    field('Bluetoothを有効にする',config.ble,'enabled','checkbox',{id:'ble-enabled-input'}));
+  $('ble-name-input').closest('label').classList.add('wide');
 }
 function renderLive() {
   $('live-cards').replaceChildren(...config.channels.map((ch,i) => el('section',{class:'panel'},
@@ -221,6 +226,7 @@ function actionOptions(isLong) {
   return [...builtins.filter(([id])=>isLong || id!=='passcode'),...config.macros.map(m=>['macro:'+m.id,'マクロ：'+m.name])];
 }
 async function testAction(action) {
+  if (action==='test_digits' && !confirm('接続先のロックを解除して、メモの空欄を開いてください。テスト用に 0123456789 を送信します。')) return;
   const macroId = action.startsWith('macro:') ? action.slice(6) : action;
   if (action.startsWith('macro:') || presetIds.includes(action)) {
     const draft = config.macros.find(macro => macro.id === macroId);
@@ -259,9 +265,11 @@ function renderButtons() {
         setDirty(); renderButtons();
       });
       action.querySelector('select').disabled = unavailable;
+      const digitsTest = selected==='passcode';
       const test = el('button', {type:'button',class:'secondary',
-        disabled: unavailable || selected==='none' || selected==='passcode',
-        'aria-label':label+'をテスト', onclick:()=>run(()=>testAction(selected))}, 'テスト');
+        disabled: unavailable || selected==='none',
+        'aria-label':digitsTest ? '数字入力をテスト' : label+'をテスト',
+        onclick:()=>run(()=>testAction(digitsTest ? 'test_digits' : selected))}, digitsTest ? '数字テスト' : 'テスト');
       actions.append(el('div',{class:'field-with-action'},action,test));
     }
     const summary = el('span');
@@ -290,6 +298,16 @@ function renderButtons() {
       actions, detail);
   }));
 }
+function chordDisplay(step) {
+  const {key, modifiers} = step;
+  if (!Number.isInteger(key) || key<4 || key>115) return '—';
+  const parts = [[17,'Control'],[68,'Option'],[34,'Shift'],[136,'Command']]
+    .filter(([mask]) => (modifiers & mask)!==0).map(([,name]) => name);
+  let symbol = {39:'0',40:'Enter',41:'Esc',42:'Backspace',43:'Tab',44:'Space',79:'→',80:'←',81:'↓',82:'↑'}[key];
+  if (key<=29) symbol = String.fromCharCode(65+key-4);
+  else if (key<=38) symbol = String(key-29);
+  return [...parts,symbol || 'HID '+key].join('＋');
+}
 function renderMacros() {
   $('macro-cards').replaceChildren(...config.macros.map(m=>{
     const card = el('section',{class:'macro-card'});
@@ -300,7 +318,16 @@ function renderMacros() {
       for(const b of config.buttons)for(const key of ['shortAction','doubleAction','longAction'])if(b[key]==='macro:'+m.id)b[key]='none';
       setDirty();renderMacros();renderButtons();
     }},'削除'));
-    card.append(title,field('マクロ名',m,'name','text',{maxlength:32}));
+    card.append(title);
+    if (presetIds.includes(m.id) && m.steps.length===1 && m.steps[0].type==='chord') {
+      const summary = el('p',{class:'muted macro-shortcut'});
+      const updateShortcut = () => { summary.textContent = '送信するキー '+chordDisplay(m.steps[0]); };
+      updateShortcut();
+      card.addEventListener('input',updateShortcut);
+      card.addEventListener('change',updateShortcut);
+      card.append(summary);
+    }
+    card.append(field('マクロ名',m,'name','text',{maxlength:32}));
     m.steps.forEach((s,index)=>{
       const fields=el('div',{class:'fields'},selectField('操作',[['chord','キー／ショートカット'],['media','メディアキー'],['text','文字列'],['wait','待機']],s.type,value=>{
         m.steps[index]={type:value,...(value==='chord'?{key:30,modifiers:0}:value==='media'?{usage:205}:value==='text'?{text:'sample'}:{ms:500})};setDirty();renderMacros();
@@ -376,6 +403,23 @@ function wifiStatus(s) {
   $('passcode').placeholder=s.passcodeSet?'登録済み（変更するときだけ入力）':'4〜12桁の数字';
   if(!passcodeDirty&&!passcodeSaving) feedback('passcode-feedback',s.passcodeSet?'パスコードは保存済みです。':'パスコードはまだ登録されていません。',s.passcodeSet?'good':'');
 }
+function renderBle(s) {
+  const ble = s?.ble;
+  const ready = s?.bleReady;
+  const state = !ble ? (s?.bleSuspended ? '一時停止中' : '通信待ち') : !ble.enabled ? '無効' : s.bleSuspended ? '一時停止中' :
+    ready ? '操作可能' : s.bleConnected ? '接続準備中' : ble.advertising ? '接続待ち' : '未接続';
+  const badge = $('ble-state');
+  if (badge.textContent !== state) badge.textContent = state;
+  badge.className = 'badge '+(ready?'good':'warn');
+  if (ble?.name) $('guide-ble-name').textContent = ble.name;
+  $('ble-advertising').textContent = ble ? (ble.advertising?'受付中':'停止中') : '—';
+  $('ble-encryption').textContent = s?.bleConnected ? (ble?.encrypted?'完了':'準備中') : '—';
+  $('ble-keyboard').textContent = s?.bleConnected ? (ble?.keyboardReady?'使用可能':'準備中') : '—';
+  $('ble-media').textContent = s?.bleConnected ? (ble?.mediaReady?'使用可能':'準備中') : '—';
+  $('ble-paired').textContent = Number.isInteger(ble?.bonds) ? ble.bonds+'台' : '—';
+  $('reconnect-ble').disabled = !ble?.enabled || s.bleSuspended;
+  $('forget-ble').disabled = !ble;
+}
 function renderFirmware(s) {
   const firmware = s?.firmware;
   if (!firmware) return;
@@ -401,6 +445,7 @@ function renderFirmware(s) {
     kind = version===firmwareTarget ? 'good' : 'error';
   } else if (!s.wifiConnected && !updating) message = '本体をインターネットに接続できるWi-Fiにつないでください。';
   else if (!message) message = 'GitHub Releasesから更新できます。';
+  if (stage==='failed' && firmware.detail) message += '（'+firmware.detail+'）';
   if ($('firmware-status').textContent!==message) feedback('firmware-status',message,kind);
 }
 
@@ -409,7 +454,7 @@ async function requestFirmwareUpdate(version) {
   const requestFeedback = $('firmware-request-feedback');
   requestFeedback.hidden = true;
   if (version && hasChanges()) {
-    requestFeedback.textContent = '未保存の変更を保存または破棄してから、更新してください。';
+    requestFeedback.textContent = '未保存の変更（'+unsavedParts().join('・')+'）を保存するか「変更を破棄」を押してから更新してください。';
     requestFeedback.hidden = false;
     return;
   }
@@ -459,7 +504,7 @@ async function savePasscode() {
 function renderInputMode() {
   const help = $('input-mode-help');
   let message = '';
-  if (isTouchEditor && inputModeDesired && !$('learn-dialog').open) {
+  if (isTouchEditor && inputModeDesired && currentStatus?.ble?.enabled!==false && !$('learn-dialog').open) {
     message = currentStatus?.bleSuspended && !currentStatus.bleConnected ?
       '文字入力中はESP32とのBluetooth接続を一時停止しています。' :
       '文字入力のためBluetoothを一時停止しています…';
@@ -575,14 +620,15 @@ async function poll() {
     const s=await api('status');
     $('stop').hidden = s.busy !== true;
     if (!s.readings && s.firmware) {
-      currentStatus = {...currentStatus, firmware:s.firmware, wifiConnected:s.wifiConnected, bleSuspended:true, bleConnected:false, bleReady:false};
+      currentStatus = {...currentStatus, firmware:s.firmware, wifiConnected:s.wifiConnected, ble:null, bleSuspended:true, bleConnected:false, bleReady:false};
       $('connection').textContent='BLE 一時停止';
       $('connection').className='badge warn';
       renderFirmware(currentStatus);
+      renderBle(currentStatus);
       return;
     }
     currentStatus=s;lastReadingAt=performance.now();
-    $('connection').textContent=s.bleSuspended?'BLE 一時停止':s.bleReady?'BLE 操作可能':s.bleConnected?'BLE 接続準備中':'BLE 未接続';
+    $('connection').textContent=s.ble?.enabled===false?'BLE 無効':s.bleSuspended?'BLE 一時停止':s.bleReady?'BLE 操作可能':s.bleConnected?'BLE 接続準備中':'BLE 未接続';
     $('connection').className='badge '+(s.bleReady?'good':'warn');
     renderInputMode();
     $('output-state').textContent=s.outputEnabled?'キー送信 ON':'キー送信 OFF';$('output-state').className='badge '+(s.outputEnabled?'good':'warn');
@@ -596,14 +642,19 @@ async function poll() {
     $('network-status').textContent=(s.wifiConnected?'Wi-Fi '+s.ip+' / '+s.rssi+' dBm':'既存Wi-Fi 未接続')+(s.apActive?' · 設定用AP '+s.apName+' / '+s.apIp:'')+' · 稼働 '+Math.floor(s.uptimeMs/1000)+'秒 · 空きRAM '+Math.round(s.freeHeap/1024)+'KB';
     wifiStatus(s);
     renderFirmware(s);
+    renderBle(s);
     $('learn-status').textContent=s.learning.active?'学習中：キー送信を停止しています。残り '+(s.learning.remainingMs/1000).toFixed(1)+'秒':s.busy?'マクロ送信中':'入力監視中';
     $('logs').replaceChildren(...s.logs.slice().reverse().map(log=>el('li',{},el('time',{},(log.at/1000).toFixed(1)+'s'),log.message)));
     renderLearning();
-  }catch(error){$('stop').hidden=true;if(csrf){$('connection').textContent='本体との通信待ち';$('connection').className='badge warn';$('wifi-connection-state').textContent='本体との通信を待っています。Wi-Fiの接続先を確認してください。';$('wifi-connection-state').className='connection-state error';}}
+  }catch(error){$('stop').hidden=true;renderBle();if(csrf){$('connection').textContent='本体との通信待ち';$('connection').className='badge warn';$('wifi-connection-state').textContent='本体との通信を待っています。Wi-Fiの接続先を確認してください。';$('wifi-connection-state').className='connection-state error';}}
   finally{polling=false; renderLearning();}
 }
 async function run(fn) { try{await fn();}catch(error){note(error.message,true);} }
 function validateLocal() {
+  const name = config.ble.name;
+  if (!name.trim() || /[\x00-\x1f\x7f]/.test(name) || new TextEncoder().encode(name).length > 29) {
+    throw new Error('Bluetooth名を29バイト以内で入力してください。');
+  }
   for(const ch of config.channels)for(const key of ['pullup','supplyMv','idleCenter','idleTolerance','hysteresis'])if(!Number.isFinite(ch[key]))throw new Error('入力設定の数値を入力してください。');
   for(const b of config.buttons)if(!Number.isFinite(b.center)||!Number.isFinite(b.tolerance))throw new Error(b.name+'の中心値・許容幅を入力するか、学習してください。');
 }
@@ -640,11 +691,12 @@ $('save').addEventListener('click',()=>run(async()=>{
   if(currentStatus?.learning.active)throw new Error('学習完了後に保存してください。');
   saving = true;
   refreshDirty();
+  let configMessage = '';
   try {
     if (dirty) {
       validateLocal();
       const submitted = clone(config);
-      await api('config','PUT',submitted);
+      configMessage = (await api('config','PUT',submitted)).message;
       saved = submitted;
       if (JSON.stringify(config) === JSON.stringify(submitted)) {
         markSaved();
@@ -656,7 +708,7 @@ $('save').addEventListener('click',()=>run(async()=>{
     // Wi-Fi goes last because it can change the current network connection.
     if(passcodeDirty)await savePasscode();
     if(wifiDirty)await saveWifi();
-    note(hasChanges() ? '送信済みの設定を保存しました。その後の変更は未保存です。' : '変更した設定を保存しました。Wi-Fiの接続結果は本体設定で確認できます。');
+    note(hasChanges() ? '送信済みの設定を保存しました。その後の変更は未保存です。' : configMessage || '変更した設定を保存しました。Wi-Fiの接続結果は本体設定で確認できます。');
   } finally {
     saving = false;
     refreshDirty();
@@ -733,6 +785,7 @@ $('restore-file').addEventListener('change',event=>run(async()=>{
 }));
 $('load-defaults').addEventListener('click',()=>run(async()=>{if(!confirm('編集内容を参考プリセットに置き換えますか？まだ本体には保存しません。'))return;config=await api('defaults');learningButton=null;setDirty();renderAll();note('旧資料の参考プリセットを読み込みました。実車の値で校正してください。');}));
 $('reboot').addEventListener('click',()=>run(async()=>{if(confirm('本体を再起動しますか？未保存の変更は失われます。'))note((await api('reboot','POST')).message);}));
+$('reconnect-ble').addEventListener('click',()=>run(async()=>{note((await api('ble/reconnect','POST')).message);await poll();}));
 $('forget-ble').addEventListener('click',()=>run(async()=>{if(confirm('BLEペアリング情報を削除して再起動しますか？接続先の端末側でもデバイス登録を解除してください。'))note((await api('ble/forget','POST')).message);}));
 $('reset').addEventListener('click',()=>run(async()=>{if(!confirm('入力・Wi-Fi・端末パスコードを初期化しますか？設定用APのパスワードとBLEペアリングは維持します。'))return;const result=await api('reset','POST',{confirm:'RESET'});note(result.message);await openWorkspace();}));
 window.addEventListener('beforeunload',event=>{if(hasChanges()){event.preventDefault();event.returnValue='';}});

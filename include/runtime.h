@@ -41,6 +41,7 @@ class Runtime {
   bool hasSamples();
   bool stopHidForFirmware();
   bool resumeHidAfterFirmware();
+  bool reconnectHid(bool suspended);
   Config config();
   void apply(const Config& cfg);
   void setPasscode(const String& passcode);

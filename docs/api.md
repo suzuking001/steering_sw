@@ -20,7 +20,7 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 | POST | `/api/restore` | `/api/config` の保存と同じ動作 |
 | POST | `/api/learn/start` | `{"channel":0}`。系統0または1を測定 |
 | POST | `/api/learn/stop` | 学習中止 |
-| POST | `/api/test` | `{"action":"macro:maps"}`。保存済み操作をテスト。passcodeは禁止 |
+| POST | `/api/test` | `{"action":"macro:maps"}` で保存済み操作をテスト。`{"action":"test_digits"}` で固定の `0123456789` を送信。登録したパスコードの送信は実ボタンの長押し専用 |
 | PUT | `/api/ble/input-mode` | `{"enabled":true}` でBLE一時停止、falseで再開。設定は保存しない |
 | POST | `/api/stop` | 実行中マクロを中止し、入力の再待機。送信の有効設定自体は維持 |
 | PUT | `/api/passcode` | `{"passcode":"数字列"}`。空文字で削除 |
@@ -28,6 +28,7 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 | POST | `/api/wifi/reconnect` | 保存済みの接続先で再接続を開始 |
 | POST | `/api/reset` | `{"confirm":"RESET"}`。入力・Wi-Fi・パスコードを初期化 |
 | POST | `/api/ble/forget` | ペアリング情報を削除して再起動 |
+| POST | `/api/ble/reconnect` | 現在の接続を切り、ペアリングを保持したまま接続を再受付 |
 | POST | `/api/reboot` | 本体再起動 |
 
 正常応答は200、形式・設定のエラーは400、Host・CSRFは403、操作不能は409、サイズ超過は413、保存失敗は507です。エラー応答は `{"error":"説明"}` です。
@@ -35,6 +36,8 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 ファームウェア更新の開始応答は202です。状態には固定の更新元 `repository`、現在版 `version`、配布版 `availableVersion`、進捗 `received` と `size`（バイト）、`stage`、`message`、初回起動検証中の `bootChecking`、トークン登録状態の `tokenSet` を含みます。トークンの値はAPIに含めません。
 
 更新の確認・実行中、`/api/status` は進捗とWi-Fi接続状態のみを返します。この間はBluetoothと各種設定の更新を一時停止します。
+
+通常時の `/api/status` の `ble` に、設定名と有効状態、接続受付 `advertising`、暗号化 `encrypted`、`keyboardReady`、`mediaReady`、保存済みペアリング件数 `bonds` が含まれます。
 
 設定保存・復元APIからSSIDを変更することはできません。現在のSSIDを使用し、接続先は `/api/wifi` で変更します。WebのJSON読み込みは現在のSSIDを維持し、出力をOFFにした状態で検証してから編集画面へ反映します。確認して「保存・適用」を押すまでは保存されません。
 
@@ -46,6 +49,7 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 - `name`: 設定名。UTF-8で96バイトまで。
 - `ssid`: 現在のWi-Fi SSID。32バイトまで。秘密情報は含まない。
 - `outputEnabled`: 通常のキー送信を有効にする真偽値。初期値false。
+- `ble`: 端末に表示する `name`（UTF-8で29バイトまで）と `enabled`。旧設定の読み込み時は初期値の `Steering Switch` と `true` を使用します。既存の本体へ旧バックアップを読み込む場合は現在のBluetooth設定を引き継ぎます。
 - `channels`: 2要素。各要素は `name`, `mode` (`mv` / `adc` / `ohm`), `pullup` (Ω), `supplyMv` (mV), `idleCenter`, `idleTolerance`, `hysteresis`。
 - `buttons`: 最大32要素、各系統16まで。各要素は `id`, `name`, `channel` (0 / 1), `center`, `tolerance`, `shortAction`, `doubleAction`, `longAction`。
 - `macros`: 最大16要素。各要素は `id`, `name`, `steps`（1〜32要素）。標準の `maps`, `youtube`, `siri`, `lock`, `app_list` は残す必要がある。ステップ内容は編集可能。
