@@ -1,17 +1,24 @@
 #pragma once
 #include "config.h"
 #include "hid.h"
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_oneshot.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 namespace sw {
 class Runtime {
   struct Reading {
-    int raw = 0, mv = 0;
-    double filtered = 0, filteredMv = 0, ohm = NAN;
+    int raw = -1, filtered = -1, filteredMv = -1;
+    double ohm = NAN;
     int recognized = kUnknown;
-    int rawWindow[5] = {}, mvWindow[5] = {}, cursor = 0;
+    int rawWindow[5] = {}, cursor = 0;
+    uint32_t lastValidAt = 0;
     bool initialized = false;
   } readings_[kChannels];
+  struct VoltageSample { uint32_t at; int16_t mv[kChannels]; };
+  static constexpr size_t kHistorySize = 96;
+  VoltageSample history_[kHistorySize];
+  size_t historyNext_ = 0, historyCount_ = 0;
   struct Learning {
     bool active = false, done = false;
     int channel = 0, count = 0, invalid = 0;
@@ -30,9 +37,16 @@ class Runtime {
   MacroRunner runner_;
   uint32_t hidEpoch_ = 0;
   bool ready_ = false, inputModePaused_ = false;
-  int accMv_ = 0;
-  uint32_t samples_ = 0;
+  adc_oneshot_unit_handle_t adc_ = nullptr;
+  adc_cali_handle_t calibration_ = nullptr;
+  adc_channel_t adcChannels_[kChannels + 1];
+  int accMv_ = -1;
+  uint32_t samples_ = 0, sampleAt_ = 0;
+  bool sampled_ = false;
+  bool beginAdc();
+  int millivolts(int raw) const;
   void tick();
+  void writeReadingsLocked(JsonObject out);
   void resetEngines();
   void logLocked(const String& message);
   bool actionLocked(const std::string& action, Gesture gesture, bool physical, String& error);
@@ -47,6 +61,7 @@ class Runtime {
   void setPasscode(const String& passcode);
   void setInputMode(bool enabled);
   void status(JsonObject out, bool includeLogs);
+  void liveReadings(JsonObject out, bool includeHistory, uint32_t after);
   void log(const String& message);
   bool startLearning(int channel, String& error);
   void stopLearning();

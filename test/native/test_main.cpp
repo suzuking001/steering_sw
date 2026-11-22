@@ -54,10 +54,18 @@ void releaseHid() { reports.push_back("release"); }
 }
 int main(int argc,char** argv) {
   if(argc>1&&std::string(argv[1])=="--fixture") { JsonDocument doc;toJson(defaults(),doc.to<JsonObject>());std::string json;serializeJson(doc,json);std::cout<<json;return 0; }
-  if(argc>1&&std::string(argv[1])=="--validate") {
+  const std::string argument = argc>1 ? argv[1] : "";
+  if(argument=="--validate" || argument=="--patch") {
     std::string data((std::istreambuf_iterator<char>(std::cin)),std::istreambuf_iterator<char>());
     JsonDocument d; Config c; std::string error;
-    bool ok=!deserializeJson(d,data)&&fromJson(d.as<JsonVariantConst>(),c,error);
+    bool ok=!deserializeJson(d,data);
+    if (ok && argument=="--patch") {
+      Config current;
+      ok=fromJson(d["current"].as<JsonVariantConst>(),current,error) &&
+        patchConfig(d["changes"].as<JsonObjectConst>(),current,c,error);
+    } else if (ok) {
+      ok=fromJson(d.as<JsonVariantConst>(),c,error);
+    }
     JsonDocument out;
     if(ok)toJson(c,out.to<JsonObject>());else out["error"]=error.empty()?"invalid JSON":error;
     std::string json;serializeJson(out,json);std::cout<<json;return ok?0:1;
@@ -86,30 +94,54 @@ int main(int argc,char** argv) {
     schedule.disconnected();
     require(schedule.fastAdvertising(), "disconnect did not restart fast advertising");
   });
-  test("BLE refreshes services before one reconnect and preserves the retry limit across link drops", [] {
+  test("BLE refreshes services before bounded reconnects with increasing waits", [] {
     BleReconnectSchedule schedule;
     using Action = BleRecoveryAction;
-    require(schedule.update(0, false, true) == Action::None, "first attempt too early");
-    require(schedule.update(9999, false, true) == Action::None, "reports did not get a full timeout");
-    require(schedule.update(10000, false, true) == Action::RefreshServices, "did not refresh services");
-    require(schedule.update(19999, false, true) == Action::None, "refresh did not get a full timeout");
-    require(schedule.update(20000, false, true) == Action::Reconnect && schedule.retryUsed(), "stalled link was not retried");
+    using Phase = BleLinkPhase;
+    require(schedule.update(0, Phase::AwaitingReports) == Action::None, "first attempt too early");
+    require(schedule.update(2999, Phase::AwaitingReports) == Action::None, "reports did not get time to restore");
+    require(schedule.update(3000, Phase::AwaitingReports) == Action::RefreshServices, "did not refresh services");
+    require(schedule.update(12999, Phase::AwaitingReports) == Action::None, "refresh did not get a full timeout");
+    require(schedule.update(13000, Phase::AwaitingReports) == Action::Reconnect && schedule.retryUsed(), "stalled link was not retried");
     schedule.disconnected();
-    require(schedule.update(21000, false, true) == Action::None, "retried on connection");
-    require(schedule.update(90000, false, true) == Action::None && schedule.retryUsed(), "entered a reconnect loop");
-    require(schedule.update(90001, true, false) == Action::None && !schedule.retryUsed(), "healthy link did not reset recovery");
-    require(schedule.update(100000, false, true) == Action::None, "healthy reports did not clear the wait timer");
-    require(schedule.update(110000, false, true) == Action::RefreshServices, "new outage could not refresh services");
+    require(schedule.update(14000, Phase::AwaitingReports) == Action::None, "retried on connection");
+    require(schedule.update(17000, Phase::AwaitingReports) == Action::RefreshServices, "second link did not get a refresh");
+    require(schedule.update(36999, Phase::AwaitingReports) == Action::None, "second attempt ignored the backoff");
+    require(schedule.update(37000, Phase::AwaitingReports) == Action::Reconnect && !schedule.retryExhausted(), "missing second retry");
+    schedule.disconnected();
+    schedule.update(38000, Phase::AwaitingReports);
+    require(schedule.update(41000, Phase::AwaitingReports) == Action::RefreshServices, "third link did not get a refresh");
+    require(schedule.update(70999, Phase::AwaitingReports) == Action::None, "third attempt ignored the backoff");
+    require(schedule.update(71000, Phase::AwaitingReports) == Action::Reconnect && schedule.retryExhausted(), "retry limit not reached");
+    schedule.disconnected();
+    require(schedule.update(90000, Phase::AwaitingReports) == Action::None && schedule.update(120000, Phase::AwaitingReports) == Action::None, "entered a reconnect loop");
+    require(schedule.update(120001, Phase::Ready) == Action::None && !schedule.retryUsed(), "healthy link did not reset recovery");
+    require(schedule.update(130000, Phase::AwaitingReports) == Action::None, "healthy reports did not clear the wait timer");
+    require(schedule.update(133000, Phase::AwaitingReports) == Action::RefreshServices, "new outage could not refresh services");
     schedule.resetRecovery();
-    require(schedule.update(120000, false, true) == Action::None, "manual reset kept the old wait timer");
-    require(schedule.update(130000, false, true) == Action::RefreshServices, "manual reset kept the old recovery step");
+    require(schedule.update(140000, Phase::AwaitingReports) == Action::None, "manual reset kept the old wait timer");
+    require(schedule.update(143000, Phase::AwaitingReports) == Action::RefreshServices, "manual reset kept the old recovery step");
+  });
+  test("BLE can recover a stalled encryption and allows a slow bonded iPad to finish securing the link", [] {
+    BleReconnectSchedule schedule;
+    using Action = BleRecoveryAction;
+    using Phase = BleLinkPhase;
+    schedule.update(0, Phase::Encrypting);
+    require(schedule.update(31440, Phase::Encrypting) == Action::None, "recovery interrupts the observed encryption delay");
+    require(schedule.update(34999, Phase::Encrypting) == Action::None, "encryption timeout fired early");
+    require(schedule.update(35000, Phase::Encrypting) == Action::Reconnect, "stalled encryption left the link unusable");
+    schedule.disconnected();
+    schedule.update(36000, Phase::Encrypting);
+    require(schedule.update(68000, Phase::AwaitingReports) == Action::None, "encryption consumed the report wait");
+    require(schedule.update(71000, Phase::AwaitingReports) == Action::RefreshServices, "report recovery did not follow encryption");
+    require(schedule.update(71100, Phase::Ready) == Action::None && !schedule.retryUsed(), "fully ready link did not reset retries");
   });
   test("BLE stalled link timeout survives millis wrap", [] {
     BleReconnectSchedule schedule;
     constexpr uint32_t start = UINT32_MAX - 200;
-    require(schedule.update(start, false, true) == BleRecoveryAction::None, "started recovery before wrap");
-    require(schedule.update(9798, false, true) == BleRecoveryAction::None, "wrapped timeout fired early");
-    require(schedule.update(9799, false, true) == BleRecoveryAction::RefreshServices, "wrapped timeout did not fire");
+    require(schedule.update(start, BleLinkPhase::AwaitingReports) == BleRecoveryAction::None, "started recovery before wrap");
+    require(schedule.update(2798, BleLinkPhase::AwaitingReports) == BleRecoveryAction::None, "wrapped timeout fired early");
+    require(schedule.update(2799, BleLinkPhase::AwaitingReports) == BleRecoveryAction::RefreshServices, "wrapped timeout did not fire");
   });
   test("all local clients can read configuration without login",[]{require(checkAccess(true,false,false),"local read rejected");require(checkAccess(true,true,true),"local write rejected");});
   test("local writes still need the automatic CSRF token",[]{require(!checkAccess(true,true,false),"write without token accepted");require(checkAccess(true,false,false),"read needs token");});

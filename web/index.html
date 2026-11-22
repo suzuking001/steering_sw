@@ -22,7 +22,7 @@
 <nav aria-label="設定カテゴリー"><button data-tab="buttons" class="selected">ボタン割当</button><button data-tab="macros">マクロ</button><button data-tab="settings">本体設定</button></nav>
 <section id="tab-buttons">
   <div class="section-heading">
-    <div><h2>ボタン割当</h2><p>カードの「学習」でスイッチを押したときの値を登録できます。</p></div>
+    <div><h2>ボタン割当</h2><p>カードの「学習」でスイッチを押したときの値を登録できます。割り当てを変更したら、そのカードで保存します。</p></div>
     <button id="add-button" type="button">ボタンを追加</button>
   </div>
   <div id="button-cards" class="button-grid"></div>
@@ -30,20 +30,23 @@
 <section id="tab-macros" hidden><div class="section-heading"><div><h2>マクロ</h2><p>キー・メディア操作・文字列・待ち時間を順番に送信します。文字列は半角英数とASCII記号に対応します。</p></div><button id="add-macro">マクロを追加</button></div><details class="panel"><summary>専用ショートカットとキー番号</summary><p>接続先の「ショートカット」でGoogleマップとYouTubeを開く操作を1つずつ作成し、ショートカットアプリから開けることを確認します。「設定 → アクセシビリティ → キーボードと入力 → フルキーボードアクセス」をオンにし、「コマンド」に表示された各ショートカットにキーを割り当てます。</p><p>各カードの「送信するキー」を接続先に登録します。キー登録画面を開いた状態で、別の端末のWeb画面から「保存済みマクロをテスト」を押すと、そのキーを入力できます。初期値はControl＋Option＋Shift＋数字です。1はGoogleマップ、2はYouTube、3はSiri、4はロック、5はアプリ一覧です。</p><p>キー番号はUSB HID Usage IDの10進数です。A=4、H=11、Q=20、1=30、2=31、3=32、4=33、5=34、0=39、Enter=40、Backspace=42、Tab=43、Space=44、→=79、←=80。</p><p>端末の日本語／英語配列や入力モードで記号の入力結果は変わります。新しいマクロは停車中に送信テストしてください。</p></details><div id="macro-cards"></div></section>
 <section id="tab-settings" hidden><h2>本体と接続の設定</h2><section class="panel">
   <h3>入力のライブモニター</h3>
+  <p id="live-connection" class="muted" role="status">測定待ち</p>
   <div id="live-cards" class="two-col"></div>
-  <details><summary>入力の詳細設定</summary><p class="muted">未押下の中心値を設定するときは、すべてのスイッチを離してください。</p><div id="input-cards" class="two-col"></div></details>
+  <details><summary>入力の詳細設定</summary><p class="muted">未押下の中心値を設定するときは、すべてのスイッチを離してください。</p><div id="input-cards" class="two-col"></div><div id="inputs-save"></div></details>
   <details id="operation-log"><summary>接続と操作ログ</summary><p id="network-status"></p><p id="learn-status" class="muted"></p><ol id="logs" class="logs"></ol></details>
 </section>
-<div class="two-col"><section class="panel"><h3>動作設定</h3><div id="general-fields" class="fields"></div><p class="muted">初回は校正を完了し、未押下で何も認識されないことを確認してからキー送信を有効にしてください。</p></section><section class="panel" id="wifi-panel"><h3>Wi-Fi接続</h3><p>ESP32を家庭・車内の2.4GHz Wi-Fiへ接続します。設定の保存と、Wi-Fiへの接続成功は別々に表示します。</p>
+<div class="two-col"><section class="panel"><h3>動作設定</h3><div id="general-fields" class="fields"></div><div id="general-save"></div><p class="muted">初回は校正を完了し、未押下で何も認識されないことを確認してからキー送信を有効にしてください。</p></section><section class="panel" id="wifi-panel"><h3>Wi-Fi接続</h3><p>ESP32を家庭・車内の2.4GHz Wi-Fiへ接続します。設定の保存と、Wi-Fiへの接続成功は別々に表示します。</p>
 <p id="wifi-saved-state" class="save-state">保存状態を確認しています…</p>
 <p id="wifi-connection-state" class="connection-state">接続状態を確認しています…</p>
+<p id="wifi-status-wait" class="connection-state waiting" role="status" hidden>ESP32からの応答待ちです。上は最後に取得したWi-Fiの状態です。</p>
+<p id="wifi-disconnects" class="muted" hidden></p>
 <div id="wifi-lan-access" class="lan-access" hidden><strong>同じネットワークのPCから開くURL</strong><a id="wifi-lan-url" href="/">—</a><button type="button" id="copy-lan-url" class="secondary">URLをコピー</button><p id="wifi-lan-detail" class="muted"></p></div>
 <p id="wifi-access-help" class="muted">ルーターへの接続に成功すると、ここにPC用URLが表示されます。192.168.4.1 はESP32の設定用Wi-Fiへ直接つないだときのアドレスです。</p>
 <form id="wifi-form" autocomplete="off"><label>SSID<input id="wifi-ssid" maxlength="32" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
 <label>Wi-Fiパスワード<input id="wifi-password" name="wifi-password" type="password" maxlength="63" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
 <label class="check"><input id="show-wifi-password" type="checkbox">入力したパスワードを表示</label>
 <label class="check"><input id="wifi-open-network" type="checkbox">パスワードなしのWi-Fiへ接続する</label>
-<div class="actions"><button id="save-wifi" type="submit">Wi-Fi設定を保存して接続</button><button id="wifi-reconnect" type="button" class="secondary">保存した設定で再接続</button></div></form>
+<div class="actions"><button id="save-wifi" type="submit">Wi-Fi設定を保存して接続</button><button id="cancel-wifi" type="button" class="secondary" disabled>変更を取り消す</button><button id="wifi-reconnect" type="button" class="secondary">保存した設定で再接続</button></div></form>
 <p id="wifi-feedback" class="form-feedback" role="status">Wi-Fi設定を入力し、保存してください。</p>
 <p class="muted">保存後も入力内容は残ります。ページを開き直したときは、保存済みパスワードを表示せず、登録状態を表示します。同じSSIDのパスワードを変更しない場合は、パスワード欄を空にして保存できます。</p></section>
 <section class="panel" id="ble-panel">
@@ -57,7 +60,7 @@
   </dl>
   <p id="ble-diagnostic" class="muted" hidden></p>
   <div id="ble-fields" class="fields"></div>
-  <p class="muted">名前や有効設定は「保存・適用」で反映します。</p>
+  <div id="ble-save"></div>
   <div class="actions"><button type="button" id="reconnect-ble" class="secondary" disabled>再接続</button><button type="button" id="forget-ble" class="secondary" disabled>ペアリングを削除して再起動</button></div>
 </section>
 <section class="panel" id="firmware-panel">
@@ -72,7 +75,17 @@
   <p class="muted">更新の確認・実行中はBluetooth操作を一時停止します。停車中に、電源を入れたまま操作してください。</p>
 </section>
 <section class="panel"><h3>端末パスコード</h3><p id="passcode-state"></p><p>4〜12桁の数字を登録できます。パスコード入力画面で割り当てた実ボタンを長押しすると1回送信します。「ボタン割当」の「数字テスト」は、ロック解除済みの端末のメモでテスト用の数字を確認するときに使います。</p><form id="passcode-form">
-<label>新しいパスコード<input id="passcode" type="password" inputmode="numeric" pattern="[0-9]{4,12}" minlength="4" maxlength="12" required autocomplete="off"></label><label class="check"><input id="show-passcode" type="checkbox">入力したパスコードを表示</label><button id="save-passcode" type="submit">登録・更新</button><button type="button" id="delete-passcode" class="secondary">削除</button></form><p id="passcode-feedback" class="form-feedback" role="status">保存状態を確認しています…</p><p class="muted">保存後も入力した値はこのページに残ります。再表示時は保存済みの内容を読み出さず、「登録済み」と表示します。NVSに保存し、バックアップには含めません。</p></section><section class="panel"><h3>ACC連動（オプション）</h3><p>保護済みのACC信号と、OFF後も送信できる電源保持回路を用意した場合に有効にします。GPIO34へ車両電源を直接つながないでください。</p><div id="acc-fields" class="fields"></div><p class="muted">旧資料の10kΩ／3.3kΩ分圧は使用しません。安定したONを一度検出してからOFFでロックを1回送ります。</p></section><section class="panel"><h3>バックアップとメンテナンス</h3><div class="actions vertical"><button id="backup" class="secondary">保存済み設定をJSONでダウンロード</button><label class="file-label">JSONを読み込んで編集<input id="restore-file" type="file" accept=".json,application/json"></label><button id="load-defaults" class="secondary">参考プリセットを編集画面へ読み込む</button><button id="reboot" class="secondary">本体を再起動</button><button id="reset" class="danger">入力・Wi-Fi・パスコードを初期化</button></div><p class="muted">JSONにWi-Fiパスワード・端末パスコードは含まれません。復元時は現在のWi-Fi接続を維持します。</p></section></div></section>
+<label>新しいパスコード<input id="passcode" type="password" inputmode="numeric" pattern="[0-9]{4,12}" minlength="4" maxlength="12" required autocomplete="off"></label><label class="check"><input id="show-passcode" type="checkbox">入力したパスコードを表示</label><div class="actions"><button id="save-passcode" type="submit">登録・更新</button><button type="button" id="cancel-passcode" class="secondary" disabled>入力を取り消す</button><button type="button" id="delete-passcode" class="secondary">削除</button></div></form><p id="passcode-feedback" class="form-feedback" role="status">保存状態を確認しています…</p><p class="muted">保存後も入力した値はこのページに残ります。再表示時は保存済みの内容を読み出さず、「登録済み」と表示します。NVSに保存し、バックアップには含めません。</p></section>
+<section class="panel"><h3>ACC連動（オプション）</h3><p>保護済みのACC信号と、OFF後も送信できる電源保持回路を用意した場合に有効にします。GPIO34へ車両電源を直接つながないでください。</p><div id="acc-fields" class="fields"></div><div id="acc-save"></div><p class="muted">旧資料の10kΩ／3.3kΩ分圧は使用しません。安定したONを一度検出してからOFFでロックを1回送ります。</p></section>
+<section class="panel" id="backup-panel"><h3>バックアップとメンテナンス</h3>
+  <div class="actions vertical"><button id="backup" class="secondary">保存済み設定をJSONでダウンロード</button><label class="file-label">JSONを読み込んで編集<input id="restore-file" type="file" accept=".json,application/json"></label><button id="load-defaults" class="secondary">参考プリセットを編集画面へ読み込む</button></div>
+  <div id="config-preview" hidden>
+    <p class="save-state" role="status">読み込んだ設定を編集中です。</p>
+    <div class="actions"><button id="save-preview">読み込んだ設定を適用</button><button id="cancel-preview" class="secondary">読み込みを取り消す</button></div>
+  </div>
+  <div class="actions vertical"><button id="reboot" class="secondary">本体を再起動</button><button id="reset" class="danger">入力・Wi-Fi・パスコードを初期化</button></div>
+  <p class="muted">JSONにWi-Fiパスワード・端末パスコードは含まれません。復元時は現在のWi-Fi接続を維持します。</p>
+</section></div></section>
 <dialog id="button-name-dialog" aria-labelledby="button-name-title">
   <form id="button-name-form" method="dialog">
     <h2 id="button-name-title">ボタンを追加</h2>
@@ -87,10 +100,10 @@
   <h2 id="learn-title">ボタンの学習</h2>
   <p id="learn-instruction">登録したいスイッチを押したまま、反応した系統の「現在値を設定する」を押してください。</p>
   <div id="learn-cards" class="two-col"></div>
+  <p id="learn-confirmation" class="read-button" hidden></p>
   <p id="learn-feedback" role="status" class="muted"></p>
-  <div class="dialog-actions"><button id="close-learn" type="button" class="secondary">閉じる</button></div>
+  <div class="dialog-actions"><button id="close-learn" type="button" class="secondary">キャンセル</button><button id="apply-learn" type="button" hidden>適用して保存</button></div>
 </dialog>
-<footer><span id="dirty-state">保存済み</span><div><button id="discard" class="secondary">変更を破棄</button><button id="save">保存・適用</button></div></footer>
 <div id="field-keyboard" class="field-keyboard" role="group" aria-label="画面キーボード" hidden></div>
 </div>
 <div id="message" role="status" aria-live="polite" hidden></div>

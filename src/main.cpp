@@ -12,10 +12,30 @@
 #include "ota_update.h"
 #include "runtime.h"
 #include "web_assets.h"
+#ifdef SW_BLE_TRACE
+#include "ble_trace.h"
+#endif
 
 using namespace sw;
 namespace {
-WebServer server(80);
+class SetupWebServer : public WebServer {
+ public:
+  using WebServer::WebServer;
+
+  void handleClient() override {
+    // A browser may open connections before it has a request to send. The
+    // single-client WebServer otherwise waits up to 5 s on each idle socket.
+    if (_currentStatus == HC_WAIT_READ && millis() - _statusChange >= 750 &&
+        !_currentClient.available() && _currentClient.connected()) {
+      _currentClient.stop();
+      ++idleTimeouts;
+    }
+    WebServer::handleClient();
+  }
+
+  uint32_t idleTimeouts = 0;
+};
+SetupWebServer server(80);
 DNSServer portalDns;
 SetupButton setupButton;
 String wifiPassword, apPassword, apName, webCsrf, githubToken;
@@ -31,6 +51,8 @@ bool apStarted = false, mdnsStarted = false, wasConnected = false, networkChange
 NetworkSchedule networkSchedule;
 std::string networkSsid;
 std::atomic<int> wifiFailureReason{0};
+std::atomic<int> wifiLastDisconnectReason{0};
+std::atomic<uint32_t> wifiDisconnectCount{0};
 std::atomic<bool> wifiAssociated{false};
 unsigned wifiAttempts = 0;
 String announcedIp;
@@ -167,6 +189,8 @@ void networkStatus(JsonObject out) {
   out["rssi"] = connected ? WiFi.RSSI() : 0;
   out["mdnsReady"] = connected && mdnsStarted; out["wifiAttempts"] = wifiAttempts;
   out["wifiFailureReason"] = reason;
+  out["wifiDisconnectCount"] = wifiDisconnectCount.load();
+  out["wifiLastDisconnectReason"] = wifiLastDisconnectReason.load();
   out["wifiState"] = !configured ? "unconfigured" : connected ? "connected" :
     wifiAssociated ? "getting_ip" : (reason && reason != WIFI_REASON_ASSOC_LEAVE) ? "failed" : "connecting";
   String error;
@@ -175,6 +199,18 @@ void networkStatus(JsonObject out) {
     error = "認証に失敗しました。Wi-Fiパスワードとルーターの接続設定を確認してください";
   else if (reason && reason != WIFI_REASON_ASSOC_LEAVE) error = "接続できませんでした。電波とルーターの設定を確認してください";
   out["wifiError"] = error;
+}
+bool readHistoryCursor(uint32_t& after) {
+  const String cursor = server.arg("after");
+  if (cursor.isEmpty() || cursor.length() > 10) return false;
+  uint64_t value = 0;
+  for (char digit : cursor) {
+    if (digit < '0' || digit > '9') return false;
+    value = value * 10 + (digit - '0');
+  }
+  if (value > UINT32_MAX) return false;
+  after = value;
+  return true;
 }
 void setupRoutes() {
   const char* keys[] = {"X-CSRF-Token"}; server.collectHeaders(keys, 1);
@@ -195,6 +231,25 @@ void setupRoutes() {
     if (!allowRequest()) return;
     JsonDocument d; d["csrf"] = webCsrf; jsonResponse(d);
   });
+#ifdef SW_BLE_TRACE
+  server.on("/api/ble/trace", HTTP_GET, [] {
+    if (!allowRequest()) return;
+    JsonDocument d;
+    d["uptimeMs"] = millis();
+    writeBleTrace(d["events"].to<JsonArray>());
+    jsonResponse(d);
+  });
+#endif
+  server.on("/api/readings", HTTP_GET, [] {
+    if (!allowRequest()) return;
+    if (firmwareBusy()) { response(409, "ファームウェアの処理中です"); return; }
+    const bool includeHistory = server.hasArg("after");
+    uint32_t after = 0;
+    if (includeHistory && !readHistoryCursor(after)) { response(400, "測定時刻が不正です"); return; }
+    JsonDocument d;
+    runtime.liveReadings(d.to<JsonObject>(), includeHistory, after);
+    jsonResponse(d);
+  });
   server.on("/api/status", HTTP_GET, [] {
     if (!allowRequest()) { return; }
     JsonDocument d;
@@ -206,10 +261,16 @@ void setupRoutes() {
       jsonResponse(d);
       return;
     }
+    const bool includeHistory = server.hasArg("after");
+    uint32_t after = 0;
+    if (includeHistory && !readHistoryCursor(after)) { response(400, "測定時刻が不正です"); return; }
     runtime.status(d.as<JsonObject>(), server.arg("logs") != "0");
+    runtime.liveReadings(d.as<JsonObject>(), includeHistory, after);
     networkStatus(d.as<JsonObject>());
     d["apActive"] = apStarted && WiFi.AP.started(); d["apName"] = apName;
-    d["apIp"] = WiFi.softAPIP().toString(); d["freeHeap"] = ESP.getFreeHeap(); jsonResponse(d);
+    d["apIp"] = WiFi.softAPIP().toString(); d["freeHeap"] = ESP.getFreeHeap();
+    d["httpIdleTimeouts"] = server.idleTimeouts;
+    jsonResponse(d);
   });
   server.on("/api/firmware/check", HTTP_POST, [] {
     if (!allowRequest(true)) return;
@@ -230,13 +291,15 @@ void setupRoutes() {
   server.on("/api/config", HTTP_GET, [] {
     if (!allowRequest()) { return; } auto c = runtime.config(); JsonDocument d; toJson(c, d.to<JsonObject>()); jsonResponse(d);
   });
-  auto save = [] {
+  auto save = [](bool partial) {
     if (!allowRequest(true)) { return; }
     JsonDocument d; if (!body(d)) return;
+    const auto old = runtime.config();
     Config c; String error; std::string parseError;
-    if (!fromJson(d.as<JsonVariantConst>(), c, parseError)) { response(400, parseError.c_str()); return; }
-    auto old = runtime.config();
-    if (d["ble"].isUnbound()) c.ble = old.ble;
+    const bool valid = partial ? patchConfig(d.as<JsonObjectConst>(), old, c, parseError) :
+      fromJson(d.as<JsonVariantConst>(), c, parseError);
+    if (!valid) { response(400, parseError.c_str()); return; }
+    if (!partial && d["ble"].isUnbound()) c.ble = old.ble;
     // Wi-Fi changes use /api/wifi so credentials can never leak into backups.
     if (c.ssid != old.ssid) { response(400, "SSIDはWi-Fi設定から変更してください。復元時は現在のSSIDを使用してください"); return; }
     if (!saveConfig(c, error)) { response(507, error); return; }
@@ -251,13 +314,14 @@ void setupRoutes() {
     }
     response(200, "設定を保存・適用しました");
   };
-  server.on("/api/config", HTTP_PUT, save);
+  server.on("/api/config", HTTP_PUT, [save] { save(false); });
+  server.on("/api/config", HTTP_PATCH, [save] { save(true); });
   server.on("/api/backup", HTTP_GET, [] {
     if (!allowRequest()) { return; }
     auto c = runtime.config(); JsonDocument d; toJson(c, d.to<JsonObject>());
     server.sendHeader("Content-Disposition", "attachment; filename=steering-config.json"); jsonResponse(d);
   });
-  server.on("/api/restore", HTTP_POST, save);
+  server.on("/api/restore", HTTP_POST, [save] { save(false); });
   server.on("/api/validate", HTTP_POST, [] {
     if (!allowRequest(true)) { return; }
     JsonDocument d; if (!body(d)) return;
@@ -449,12 +513,17 @@ void setup() {
   bleEnabled = c.ble.enabled;
   hidState.suspended = !bleEnabled;
   if (!beginHid(c.ble.name)) fatalStartup("FATAL: Cannot start Bluetooth.");
-  if (!runtime.begin(c, passcode)) fatalStartup("FATAL: Cannot start input task.");
+  if (!runtime.begin(c, passcode)) fatalStartup("FATAL: Cannot initialize ADC or start input task.");
   runtime.log(restored ? "保存設定を復元しました" : "参考プリセットで開始。校正後に送信を有効にしてください");
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) { wifiAssociated = true; wifiFailureReason = 0; }
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-      wifiAssociated = false; wifiFailureReason = info.wifi_sta_disconnected.reason;
+      const int reason = info.wifi_sta_disconnected.reason;
+      if (wifiAssociated.exchange(false) && reason != WIFI_REASON_ASSOC_LEAVE) {
+        wifiLastDisconnectReason = reason;
+        ++wifiDisconnectCount;
+      }
+      wifiFailureReason = reason;
     }
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) { wifiAssociated = true; wifiFailureReason = 0; }
   });

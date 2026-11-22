@@ -1,5 +1,9 @@
 #include "hid.h"
 #include "ble_reconnect.h"
+#include <Preferences.h>
+#ifdef SW_BLE_TRACE
+#include "ble_trace.h"
+#endif
 namespace sw {
 HidState hidState;
 namespace {
@@ -8,10 +12,12 @@ constexpr uint8_t bootProtocol = 0, reportProtocol = 1;
 constexpr uint16_t fastAdvertisingUnits = 32;  // 20 ms in 0.625 ms units.
 constexpr uint16_t slowAdvertisingUnits = 244; // 152.5 ms in 0.625 ms units.
 constexpr uint32_t maintenanceIntervalMs = 250;
+constexpr uint8_t hidSchemaVersion = 1; // First persisted revision includes Boot Keyboard reports.
 BleReconnectSchedule reconnect;
 uint32_t lastMaintenanceAt = 0;
-std::atomic<bool> restartAdvertising{true}, peerBonded{false};
+std::atomic<bool> restartAdvertising{true}, peerBonded{false}, requestedConnParams{false};
 std::atomic<uint16_t> peerHandle{BLE_HS_CONN_HANDLE_NONE};
+std::atomic<uint16_t> serviceChangedHandle{0};
 void clearConnectionState() {
   hidState.encrypted = false;
   hidState.keyboardSubscribed = false;
@@ -20,22 +26,35 @@ void clearConnectionState() {
   hidState.bootMode = false;
   hidState.reportMapRead = false;
   peerBonded = false;
+  if (protocolMode) protocolMode->setValue(reportProtocol);
 }
 bool encryptedLink() {
   return !hidState.suspended && hidState.connected && hidState.encrypted;
 }
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
-    peerHandle = info.getConnHandle();
     if (hidState.suspended) { server->disconnect(info.getConnHandle()); return; }
-    clearConnectionState();
-    protocolMode->setValue(reportProtocol);
+    // On bonded links NimBLE can restore encryption and report subscriptions
+    // before delivering onConnect. Clear report state only on disconnect.
+    const bool encrypted = info.isEncrypted();
+    hidState.encrypted = encrypted;
+    peerBonded = info.isBonded();
+    requestedConnParams = false;
     hidState.connected = true;
     hidState.epoch.fetch_add(1);
-    server->updateConnParams(info.getConnHandle(), 12, 24, 0, 400);
-    NimBLEDevice::startSecurity(info.getConnHandle());
+    peerHandle = info.getConnHandle();
+#ifdef SW_BLE_TRACE
+    sw_ble_trace(SW_BLE_CONNECTED, info.getConnHandle(), 0, 0);
+#endif
+    if (encrypted) return;
+    int error = 0;
+    const bool started = NimBLEDevice::startSecurity(info.getConnHandle(), &error);
+    hidState.securityError = started ? 0 : error;
   }
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int reason) override {
+#ifdef SW_BLE_TRACE
+    sw_ble_trace(SW_BLE_DISCONNECTED, info.getConnHandle(), 0, reason);
+#endif
     hidState.connected = false;
     clearConnectionState();
     hidState.disconnectReason = reason;
@@ -47,15 +66,18 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     if (hidState.suspended) { NimBLEDevice::getServer()->disconnect(info.getConnHandle()); return; }
     peerBonded = info.isBonded();
     hidState.encrypted = info.isEncrypted();
-    if (!info.isEncrypted()) NimBLEDevice::getServer()->disconnect(info.getConnHandle());
   }
 } serverCallbacks;
 class ReportCallbacks : public NimBLECharacteristicCallbacks {
   std::atomic<bool>& subscribed_;
  public:
   explicit ReportCallbacks(std::atomic<bool>& subscribed) : subscribed_(subscribed) {}
-  void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t value) override {
+  void onSubscribe(NimBLECharacteristic* characteristic, NimBLEConnInfo& info, uint16_t value) override {
     subscribed_ = (value & 1) != 0;
+#ifdef SW_BLE_TRACE
+    const uint8_t report = characteristic == keyboard ? 1 : characteristic == media ? 2 : 3;
+    sw_ble_trace(SW_BLE_HID_SUBSCRIBE, info.getConnHandle(), report, value);
+#endif
   }
 } keyCallbacks(hidState.keyboardSubscribed), mediaCallbacks(hidState.mediaSubscribed),
   bootKeyCallbacks(hidState.bootKeyboardSubscribed);
@@ -73,6 +95,33 @@ class ProtocolCallbacks : public NimBLECharacteristicCallbacks {
 class ReportMapCallbacks : public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic*, NimBLEConnInfo&) override { hidState.reportMapRead = true; }
 } reportMapCallbacks;
+
+int trackGapEvent(ble_gap_event* event, void*) {
+  const uint16_t handle = peerHandle;
+  if (event->type == BLE_GAP_EVENT_ENC_CHANGE &&
+      (handle == BLE_HS_CONN_HANDLE_NONE || event->enc_change.conn_handle == handle)) {
+    hidState.securityError = event->enc_change.status;
+#ifdef SW_BLE_TRACE
+    sw_ble_trace(SW_BLE_SECURITY_RESULT, event->enc_change.conn_handle, 0, event->enc_change.status);
+#endif
+  } else if (event->type == BLE_GAP_EVENT_NOTIFY_TX) {
+    const auto& tx = event->notify_tx;
+    if (tx.conn_handle == peerHandle && tx.indication && tx.attr_handle == serviceChangedHandle && tx.status == BLE_HS_EDONE) {
+      ++hidState.serviceRefreshConfirmations;
+    }
+  }
+  return 0;
+}
+void refreshHidSchema(NimBLEServer* server) {
+  Preferences preferences;
+  if (!preferences.begin("sw-ble", false)) return;
+  if (preferences.getUChar("gatt-schema", 0) == hidSchemaVersion) return;
+  if (NimBLEDevice::getNumBonds() > 0) {
+    server->sendServiceChangedIndication();
+    ++hidState.serviceRefreshes;
+  }
+  preferences.putUChar("gatt-schema", hidSchemaVersion);
+}
 
 NimBLECharacteristic* readyKeyboard() {
   if (!encryptedLink()) return nullptr;
@@ -109,6 +158,7 @@ bool beginHid(const std::string& name) {
   auto bootOutput = service->createCharacteristic("2a32", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
   protocolMode = hid.getProtocolMode();
+  protocolMode->setValue(reportProtocol);
   bootKeyboard->setCallbacks(&bootKeyCallbacks);
   protocolMode->setCallbacks(&protocolCallbacks);
   service->getCharacteristic("2a4b")->setCallbacks(&reportMapCallbacks);
@@ -117,6 +167,12 @@ bool beginHid(const std::string& name) {
   keyboard->setValue(zeros, 8); media->setValue(zeros, 2);
   bootKeyboard->setValue(zeros, 8); bootOutput->setValue(zeros, 1);
   if (!server->start()) return false;
+  const NimBLEUUID gatt(uint16_t{0x1801}), changed(uint16_t{0x2a05});
+  uint16_t handle = 0;
+  ble_gatts_find_chr(gatt.getBase(), changed.getBase(), nullptr, &handle);
+  serviceChangedHandle = handle;
+  NimBLEDevice::setCustomGapHandler(trackGapEvent);
+  refreshHidSchema(server);
   auto advertising = NimBLEDevice::getAdvertising();
   advertising->setAppearance(HID_KEYBOARD); advertising->addServiceUUID(hid.getHidService()->getUUID());
   advertising->enableScanResponse(true);
@@ -179,10 +235,12 @@ void maintainHid() {
   const uint16_t handle = peerHandle;
   if (handle != BLE_HS_CONN_HANDLE_NONE) {
     const bool ready = hidReady();
-    const bool awaitingReports = !ready && peerBonded && hidState.encrypted;
-    const auto action = reconnect.update(now, ready, awaitingReports);
-    if (action == BleRecoveryAction::None || peerHandle != handle || hidReady()) return;
     auto server = NimBLEDevice::getServer();
+    if (ready && !requestedConnParams.exchange(true)) server->updateConnParams(handle, 12, 24, 0, 400);
+    const auto phase = ready ? BleLinkPhase::Ready : !hidState.encrypted ? BleLinkPhase::Encrypting :
+                       peerBonded ? BleLinkPhase::AwaitingReports : BleLinkPhase::Disconnected;
+    const auto action = reconnect.update(now, phase);
+    if (action == BleRecoveryAction::None || peerHandle != handle || hidReady()) return;
     if (action == BleRecoveryAction::RefreshServices) {
       server->sendServiceChangedIndication();
       ++hidState.serviceRefreshes;
@@ -201,6 +259,7 @@ void maintainHid() {
   }
 }
 bool hidAutomaticRetryUsed() { return reconnect.retryUsed(); }
+bool hidAutomaticRetryExhausted() { return reconnect.retryExhausted(); }
 bool sendKey(uint8_t key, uint8_t modifiers) {
   auto reportCharacteristic = readyKeyboard();
   if (!reportCharacteristic) return false;

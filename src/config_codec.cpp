@@ -151,4 +151,26 @@ bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
   }
   result = std::move(c); return true;
 }
+bool patchConfig(JsonObjectConst changes, const Config& current, Config& result, std::string& error) {
+  if (changes.size() == 0) {
+    error = "保存する設定を指定してください";
+    return false;
+  }
+  JsonDocument merged;
+  auto settings = merged.to<JsonObject>();
+  toJson(current, settings);
+  for (JsonPairConst change : changes) {
+    const auto key = change.key();
+    if (settings[key].isUnbound() || key == "ssid" || key == "version") {
+      error = "変更できない設定項目です";
+      return false;
+    }
+    settings[key].set(change.value());
+  }
+  if (merged.overflowed()) {
+    error = "設定を展開できません";
+    return false;
+  }
+  return fromJson(merged.as<JsonVariantConst>(), result, error);
+}
 } // namespace sw

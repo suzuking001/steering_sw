@@ -13,17 +13,43 @@ let fixtureCsrf='fixture-csrf',inputModePaused=false,delayInputMode=false,delayI
 let pausedTestRequests=0;
 const inputModeRequests=[];
 let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,rejectNextPin=false;
+let failStatus=false,statusDelayMs=0,wifiDisconnectCount=0,wifiLastDisconnectReason=0;
 const savedWifiRequests=[],saveOrder=[];
 let state=fixture(),learning=null,learningAt=0,passcodeSet=false,testedActions=[];
 let macroBusy=false, stopRequests=0;
 let bleAttached=true, bleEncrypted=true, bleReconnectRequests=0;
 let bleKeyboard=true, bleMedia=true, bleProtocol='report', bleMapRead=false, bleDisconnectReason=0;
+let bleSecurityError=0, bleRetryExhausted=false;
 let key2Millivolts=2750;
+let key1Saturated=false, key1ReadFailed=false, insertLivePulse=false, failLiveReadings=false, frozenSampleAt;
+const deviceBootAt=performance.now();
 const firmware={repository:'suzuking001/steering_sw',version:'1.0.1',availableVersion:'',stage:'idle',tokenSet:false,received:0,size:0,message:'',bootChecking:false};
 const firmwareRequests=[];
-const statusRequests=[];
+const statusRequests=[], statusHistoryRequests=[], readingRequests=[];
 const errors=[];let checks=0;
 function check(condition,message){assert.ok(condition,message);checks++;console.log('PASS '+message);}
+function readingFrame(after=null){
+  const uptimeMs=Math.floor(performance.now()-deviceBootAt);
+  const sampleAtMs=frozenSampleAt ?? Math.floor(uptimeMs/5)*5;
+  const readings=state.channels.map((c,i)=>{
+    const common={name:c.name,mode:c.mode,pin:[36,39][i],buttonId:null};
+    if(i===0&&key1ReadFailed) return {...common,raw:null,adc:null,mv:null,ohm:null,ohmState:'adc_error',button:'測定不可'};
+    const saturated=i===0&&key1Saturated;
+    const adc=saturated?4095:3890;
+    return {...common,raw:adc,adc,mv:i===0?(saturated?3150:3050):key2Millivolts,
+      ohm:i===0?(saturated?null:5211):5187,ohmState:saturated?'adc_saturated':'ok',button:'未押下'};
+  });
+  const history=[];
+  if(after!==null){
+    const since=Math.max(Number(after),sampleAtMs-2400);
+    for(let at=Math.floor(since/25)*25+25;at<=sampleAtMs;at+=25) {
+      const mv=insertLivePulse && at+25<=sampleAtMs ? 1405 : readings[0].mv;
+      history.push([at,mv,key2Millivolts]);
+      if(mv===1405) insertLivePulse=false;
+    }
+  }
+  return {uptimeMs,sampleAtMs,samples:1+sampleAtMs/5,inputModePaused,readings,history};
+}
 const csp="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'";
 const server=http.createServer(async(req,res)=>{
   const reply=(code,value)=>{res.writeHead(code,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
@@ -39,9 +65,19 @@ const server=http.createServer(async(req,res)=>{
     const path=requestURL.pathname.slice(5);
     if(req.method!=='GET'&&req.headers['x-csrf-token']!==fixtureCsrf){reply(403,{error:'CSRF'});return;}
     if(path==='session'){reply(200,{csrf:fixtureCsrf});return;}
+    if(path==='readings'){
+      const after=requestURL.searchParams.get('after');
+      readingRequests.push(after);
+      if(failLiveReadings){reply(503,{error:'fixture telemetry failure'});return;}
+      reply(200,readingFrame(after));return;
+    }
     if(path==='status'){
       const includeLogs=requestURL.searchParams.get('logs')!=='0';
+      const after=requestURL.searchParams.get('after');
       statusRequests.push(includeLogs);
+      if(after!==null) statusHistoryRequests.push(after);
+      if(failStatus){res.destroy();return;}
+      if(statusDelayMs) await new Promise(resolve=>setTimeout(resolve,statusDelayMs));
       if(['checking','downloading','verifying','restarting'].includes(firmware.stage)){
         reply(200,{firmware,wifiConnected:wifiState==='connected'});return;
       }
@@ -49,18 +85,21 @@ const server=http.createServer(async(req,res)=>{
       const paused=!state.ble.enabled, connected=bleAttached&&!paused;
       const encrypted=connected&&bleEncrypted;
       const ble={...state.ble,advertising:!paused&&!connected,encrypted,keyboardReady:encrypted&&bleKeyboard,mediaReady:encrypted&&bleMedia,
-        protocolMode:bleProtocol,reportMapRead:bleMapRead,disconnectReason:bleDisconnectReason,bonds:1,
-        advertisingIntervalMs:!paused&&!connected?20:undefined,automaticReconnects:1,serviceRefreshes:1,automaticRetryUsed:true};
-      reply(200,{uptimeMs:Date.now()%100000,samples:12345,outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:ble.keyboardReady||ble.mediaReady,bleSuspended:paused,inputModePaused,ble,busy:macroBusy,passcodeSet,accMv:2000,
-        readings:state.channels.map((c,i)=>({name:c.name,mode:c.mode,pin:[36,39][i],raw:3890,adc:3890,mv:i===0?3050:key2Millivolts,ohm:i===0?5211:5187,button:'未押下',buttonId:null})),
+        protocolMode:bleProtocol,reportMapRead:bleMapRead,disconnectReason:bleDisconnectReason,securityError:bleSecurityError,bonds:1,
+        advertisingIntervalMs:!paused&&!connected?20:undefined,automaticReconnects:1,serviceRefreshes:1,serviceRefreshConfirmations:0,
+        automaticRetryUsed:true,automaticRetryExhausted:bleRetryExhausted};
+      reply(200,{...readingFrame(after),outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:ble.keyboardReady||ble.mediaReady,bleSuspended:paused,ble,busy:macroBusy,passcodeSet,accMv:2000,
         firmware,learning:{active:!!learning&&!done,done:!!done,channel:learning?.channel||0,count:400,error:'',remainingMs:done?0:200,center:3895,minimum:3890,maximum:3900,tolerance:15},
-        wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:includeLogs?[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]:undefined});return;
+        wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiDisconnectCount,wifiLastDisconnectReason,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:includeLogs?[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]:undefined});return;
     }
     if(path==='config'&&req.method==='GET'||path==='backup'){reply(200,state);return;}
     if(path==='defaults'){const data=fixture();data.ssid=state.ssid;reply(200,data);return;}
     if(['config','validate','restore'].includes(path)){
       try{
-        const parsed=JSON.parse(execFileSync(binary,['--validate'],{input:JSON.stringify(body),encoding:'utf8',stdio:['pipe','pipe','pipe']}));
+        const patch=req.method==='PATCH';
+        const parsed=JSON.parse(execFileSync(binary,[patch?'--patch':'--validate'],{
+          input:JSON.stringify(patch?{current:state,changes:body}:body),encoding:'utf8',stdio:['pipe','pipe','pipe'],
+        }));
         if(path==='validate')reply(200,parsed);else{state=parsed;learning=null;reply(200,{message:'設定を保存・適用しました'});}return;
       }catch(error){reply(400,JSON.parse(error.stdout||'{"error":"validation failed"}'));return;}
     }
@@ -117,16 +156,22 @@ try{
   async function evaluate(expression){const out=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(out.exceptionDetails)throw new Error(out.exceptionDetails.exception?.description||out.exceptionDetails.text);return out.result?.value;}
   async function wait(expression){for(let i=0;i<150;i++){if(await evaluate(expression))return;await new Promise(r=>setTimeout(r,100));}throw new Error('Timed out: '+expression);}
   await call('Page.enable');await call('Runtime.enable');
+  await call('Page.addScriptToEvaluateOnNewDocument',{source:`globalThis.fill=(root,label,value)=>{
+    const node=[...document.querySelector(root).querySelectorAll('label')]
+      .find(x=>x.firstChild?.textContent===label)?.querySelector('input');
+    if(!node)throw new Error('Field not found: '+label);
+    node.value=value;node.dispatchEvent(new Event('input',{bubbles:true}));
+  };`});
   await call('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
   await call('Page.navigate',{url});await wait('!document.getElementById("workspace").hidden && currentStatus !== undefined');
-  await evaluate(`globalThis.fill=(root,label,value)=>{const node=[...document.querySelector(root).querySelectorAll('label')].find(x=>x.firstChild?.textContent===label)?.querySelector('input');if(!node)throw new Error('Field not found: '+label);node.value=value;node.dispatchEvent(new Event('input',{bubbles:true}));};`);
   check(await evaluate('!document.getElementById("login-form") && !document.getElementById("admin-form") && !document.getElementById("logout")'),'local network opens settings without Web login or password controls');
   check(await evaluate('document.querySelectorAll(".button-card").length === 9 && document.querySelectorAll(".macro-card").length === 5'),'nine buttons and five editable shortcuts render');
   check(await evaluate('activeTab==="buttons" && document.querySelectorAll("nav [data-tab]").length===3'),'opens directly to button assignments with three tabs');
+  check(await evaluate('!document.querySelector("footer, #save, #discard")'),'there is no fixed global save bar');
   const idleStart=statusRequests.length;
   await new Promise(resolve=>setTimeout(resolve,1300));
   const idleRequests=statusRequests.slice(idleStart);
-  check(idleRequests.length>=1 && idleRequests.length<=2 && idleRequests.every(request=>!request),
+  check(idleRequests.length>=1 && idleRequests.length<=2 && idleRequests.every(request=>!request) && !readingRequests.length,
     'ordinary screens poll about once a second and do not request log data');
   await evaluate(`Object.defineProperty(document,'hidden',{value:true,configurable:true});
     document.dispatchEvent(new Event('visibilitychange'));`);
@@ -145,31 +190,77 @@ try{
   check(await evaluate('document.getElementById("metric-0-0").textContent==="3,890" && [...document.querySelectorAll("#live-cards canvas")].every(chart=>chart.width>300)'),'two live charts are drawn in settings');
   await evaluate(`document.getElementById('operation-log').open=true;`);
   await wait('document.querySelector("#logs li")');
-  const liveStart=statusRequests.length;
+  const liveStart=statusRequests.length, readingsStart=readingRequests.length;
   await evaluate(`globalThis.logRow=document.querySelector('#logs li');
     globalThis.canvasChanges=0;
     const canvasObserver=new MutationObserver(records=>{canvasChanges+=records.length;});
     for (const chart of document.querySelectorAll('#live-cards canvas')) canvasObserver.observe(chart,{attributes:true,attributeFilter:['width','height']});`);
-  await new Promise(resolve=>setTimeout(resolve,750));
-  check(statusRequests.slice(liveStart).filter(Boolean).length>=2 &&
+  await new Promise(resolve=>setTimeout(resolve,1150));
+  const liveStatusCount=statusRequests.slice(liveStart).filter(Boolean).length;
+  check(liveStatusCount>=1 && liveStatusCount<=2 && readingRequests.length-readingsStart>=4 &&
     await evaluate('document.querySelector("#logs li")===logRow && canvasChanges===0'),
-    'live monitoring remains fast without recreating unchanged logs or resizing canvas buffers');
+    'live monitoring polls the readings more often than full status and reuses chart buffers and log rows');
+  insertLivePulse=true;
+  await wait('histories[0].some(point=>point.mv===1405)');
+  check(await evaluate('document.getElementById("metric-0-1").textContent==="3,050"'),
+    'the chart shows a short press between requests while the numeric reading shows the latest voltage');
+  await evaluate(`document.getElementById('wifi-panel').scrollIntoView();`);
+  await wait('!liveMonitorVisible && !polling');
+  const offscreenReadingsStart=readingRequests.length, offscreenStatusStart=statusHistoryRequests.length;
+  await evaluate(`globalThis.offscreenStart = histories[0].at(-1).at;`);
+  insertLivePulse=true;
+  await wait('histories[0].at(-1).at - offscreenStart >= 2700');
+  check(readingRequests.length===offscreenReadingsStart && statusHistoryRequests.length-offscreenStatusStart>=3 &&
+    await evaluate(`(() => {
+      const samples = histories[0].filter(point=>point.at>=offscreenStart);
+      return samples.some(point=>point.mv===1405) && samples.slice(1).every((point,i)=>point.at-samples[i].at<=100);
+    })()`), 'scrolling the monitor offscreen retains a continuous chart through ordinary status requests');
+  await evaluate('window.scrollTo(0,0)');
+  await wait('liveMonitorVisible');
+  key1Saturated=true;
+  await wait('document.getElementById("reading-detail-0").textContent.includes("ADC上限")');
+  check(await evaluate('document.getElementById("metric-0-1").textContent==="3,150" && document.getElementById("metric-0-2").textContent==="測定不可" && document.getElementById("live-connection").hidden'),
+    'ADC saturation leaves voltage visible and reports why resistance is unavailable');
+  failLiveReadings=true;
+  await wait('document.getElementById("live-connection").textContent==="測定データの通信待ち"');
+  check(await evaluate('!hasFreshReading() && document.getElementById("reading-detail-0").textContent.includes("ADC上限")'),
+    'communication failure invalidates capture and keeps the last displayed ADC diagnosis');
+  failLiveReadings=false; key1Saturated=false;
+  await wait('hasFreshReading() && document.getElementById("live-connection").hidden');
+  key1ReadFailed=true;
+  await wait('document.getElementById("reading-detail-0").textContent.includes("ADC読み取りエラー") && histories[0].at(-1)?.mv===null');
+  check(await evaluate('document.getElementById("metric-0-1").textContent==="—" && document.getElementById("metric-1-1").textContent==="2,750"'),
+    'a failed ADC conversion leaves a graph gap without substituting zero or affecting the other channel');
+  key1ReadFailed=false;
+  frozenSampleAt=readingFrame().sampleAtMs;
+  await wait('document.getElementById("live-connection").textContent==="本体の測定更新待ち"');
+  check(await evaluate('!hasFreshReading()'), 'repeated HTTP responses cannot make a stopped ADC reading fresh');
+  frozenSampleAt=undefined;
+  await wait('hasFreshReading()');
   await evaluate(`document.getElementById('operation-log').open=false;`);
   bleEncrypted=false;
+  bleSecurityError=6;
   await wait('document.getElementById("ble-state").textContent==="暗号化待ち"');
   check(await evaluate(`document.getElementById('ble-encryption').textContent==='準備中' &&
     document.getElementById('ble-advertising').textContent==='接続済み' &&
+    document.getElementById('connection').textContent==='BLE 暗号化待ち' &&
+    document.getElementById('ble-diagnostic').textContent.includes('暗号化エラー 0x6') &&
     document.getElementById('ble-keyboard').textContent==='準備中' && document.getElementById('ble-paired').textContent==='1台'`),
     'Bluetooth panel distinguishes the link, security, key services and saved pairings');
   bleEncrypted=bleMapRead=true;
   bleKeyboard=bleMedia=false;
+  bleSecurityError=0;
   bleDisconnectReason=0x213;
   await wait('document.getElementById("ble-state").textContent==="キー通知待ち"');
   check(await evaluate(`document.getElementById('ble-encryption').textContent==='完了' &&
     document.getElementById('ble-diagnostic').textContent.includes('読み取りあり') &&
     document.getElementById('ble-diagnostic').textContent.includes('0x213') &&
-    document.getElementById('ble-diagnostic').textContent.includes('サービス情報の再確認を通知 1回') &&
-    document.getElementById('ble-diagnostic').textContent.includes('自動再試行済み')`), 'encrypted links show service refresh and the end of automatic recovery');
+    document.getElementById('ble-diagnostic').textContent.includes('サービス情報の再確認を要求 1回（端末の確認応答 0回）') &&
+    document.getElementById('ble-diagnostic').textContent.includes('自動再試行中')`), 'encrypted links show service refresh requests and whether the host acknowledged them');
+  bleRetryExhausted=true;
+  await wait('document.getElementById("ble-diagnostic").textContent.includes("自動再試行の上限に達しました")');
+  check(await evaluate('document.getElementById("ble-state").textContent==="キー通知待ち"'), 'retry exhaustion leaves the stalled phase visible');
+  bleRetryExhausted=false;
   bleProtocol='boot';
   bleKeyboard=true;
   await wait('document.getElementById("ble-state").textContent==="一部操作可能"');
@@ -184,23 +275,23 @@ try{
     document.getElementById('ble-diagnostic').textContent.includes('自動再接続の試行 1回')`),
     'Bluetooth reconnect retains pairings and displays the advertising interval and retry count');
   await evaluate(`fill('#ble-fields','端末に表示されるBluetooth名','運転席 Steering');document.getElementById('ble-enabled-input').click();
-    document.getElementById('save').click();`);
+    document.getElementById('save-ble').click();`);
   await wait('!dirty && document.getElementById("ble-state").textContent==="無効"');
   check(state.ble.name==='運転席 Steering' && !state.ble.enabled && await evaluate('document.getElementById("reconnect-ble").disabled'),
-    'Bluetooth name and enable setting save through the normal footer');
+    'Bluetooth name and enable setting save from the Bluetooth card');
   bleAttached=bleEncrypted=true;
   await evaluate(`fill('#ble-fields','端末に表示されるBluetooth名','Steering Switch');document.getElementById('ble-enabled-input').click();
-    document.getElementById('save').click();`);
+    document.getElementById('save-ble').click();`);
   await wait('!dirty && document.getElementById("ble-state").textContent==="操作可能"');
   let shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'desktop.png'),Buffer.from(shot.data,'base64'));
   await evaluate(`document.querySelector('#input-cards').closest('details').open=true;fill('#input-cards','供給電圧 mV',3200);`);
   check(await evaluate('dirty && config.channels[0].supplyMv===3200'),'circuit constants are editable without changing saved state');
-  await evaluate(`document.getElementById('save').click()`);await wait('!dirty');check(state.channels[0].supplyMv===3200,'saving applies validated circuit constants');
+  await evaluate(`document.getElementById('save-inputs').click()`);await wait('!dirty');check(state.channels[0].supplyMv===3200,'saving applies validated circuit constants');
   const referenceCenter=state.buttons[0].center, overlappingCenter=state.buttons[1].center;
-  await evaluate(`document.querySelector('[data-tab="buttons"]').click();document.querySelector('#button-cards details').open=true;fill('#button-cards','中心値',${overlappingCenter});document.getElementById('save').click();`);
-  await wait('document.getElementById("message").textContent.includes("重複")');
+  await evaluate(`document.querySelector('[data-tab="buttons"]').click();document.querySelector('#button-cards details').open=true;fill('#button-cards','中心値',${overlappingCenter});document.querySelector('#button-cards .save-item').click();`);
+  await wait('document.querySelector("#button-cards .config-save .error")?.textContent.includes("重複")');
   check(state.buttons[0].center===referenceCenter,'overlapping ranges are rejected without overwriting saved config');
-  await evaluate(`fill('#button-cards','中心値',${referenceCenter});document.getElementById('save').click();`);await wait('!dirty');
+  await evaluate(`document.querySelector('#button-cards .cancel-item').click();`);await wait('!dirty');
   await evaluate(`document.getElementById('add-button').click();`);
   check(await evaluate('document.getElementById("button-name-dialog").open && document.getElementById("button-name-input").value==="ボタン1"'),'adding a button opens a dialog with a unique default name');
   await evaluate(`document.getElementById('button-name-form').requestSubmit();document.getElementById('add-button').click();`);
@@ -208,9 +299,25 @@ try{
   await evaluate(`document.getElementById('cancel-button-name').click();[...document.querySelectorAll('.learn-button')].at(-1).click();`);
   await wait('document.getElementById("learn-dialog").open && !document.getElementById("capture-1").disabled');
   check(await evaluate('currentStatus.inputModePaused && currentStatus.bleConnected && document.getElementById("learn-mv-0").textContent==="3050 mV" && document.getElementById("learn-mv-1").textContent==="2750 mV"'),'learning displays both measured voltages with key output paused and Bluetooth connected');
+  await evaluate(`document.getElementById('capture-1').click();`);
+  check(state.buttons.length===9 && await evaluate(`config.buttons[9].center===null &&
+    document.getElementById('learn-confirmation').textContent==='KEY2 · 2750 mV' &&
+    !document.getElementById('apply-learn').hidden`),'a captured value is held for confirmation without changing the draft or stored assignments');
+  await evaluate(`document.getElementById('apply-learn').click();`);
+  await wait('document.getElementById("learn-feedback").textContent.includes("重複")');
+  check(state.buttons.length===9 && await evaluate('document.getElementById("learn-dialog").open && currentStatus.inputModePaused'),
+    'an overlapping sample leaves the dialog open and preserves stored assignments');
+  await evaluate(`document.getElementById('close-learn').click();`);
+  await wait('!currentStatus.inputModePaused && !inputModeRequest');
+  check(state.buttons.length===9 && await evaluate('config.buttons[9].center===null'),'cancel leaves the assignment untouched');
+  key2Millivolts=2500;
+  await evaluate(`fill('#button-cards','ボタン名','別カード編集中');[...document.querySelectorAll('.learn-button')].at(-1).click();`);
+  await wait('!document.getElementById("capture-1").disabled && document.getElementById("learn-mv-1").textContent==="2500 mV"');
   delayInputResume=true;
   const beforeLearningTest=testedActions.length;
-  await evaluate(`document.getElementById('capture-1').click();
+  await evaluate(`document.getElementById('capture-1').click();document.getElementById('apply-learn').click();`);
+  await wait('!document.getElementById("learn-dialog").open');
+  await evaluate(`
     const volumeId=config.buttons.find(button=>button.shortAction==='volume_up').id;
     const test=document.querySelector('[data-button-id="'+volumeId+'"] button[aria-label="短押しをテスト"]');
     test.click();test.click();`);
@@ -218,8 +325,10 @@ try{
   check(pausedTestRequests===0 && testedActions.slice(beforeLearningTest).join(',')==='volume_up',
     'testing immediately after learning waits for the resume response and queues no duplicate command');
   delayInputResume=false;
-  check(await evaluate('config.buttons[9].channel===1 && config.buttons[9].center===2750 && dirty'),'KEY2 capture assigns the channel and voltage to the draft card');
-  check(state.buttons.length===9,'learning does not silently save the card');
+  check(state.buttons.length===10 && state.buttons[9].channel===1 && state.buttons[9].center===2500 &&
+    state.buttons[0].name!=='別カード編集中' && await evaluate('dirty && config.buttons[0].name==="別カード編集中"'),
+    'confirming learning saves the captured card and leaves other card drafts untouched');
+  await evaluate(`document.querySelector('#button-cards .cancel-item').click();`);
   await evaluate(`config.buttons[9].name='<img src=x onerror=alert(1)>';renderButtons();`);
   check(await evaluate('document.querySelectorAll("#button-cards img").length===0 && document.getElementById("button-cards").textContent.includes("<img")'),'user-defined labels render as text');
   await evaluate(`globalThis.newCard='[data-button-id="'+config.buttons[9].id+'"]';
@@ -239,7 +348,7 @@ try{
     await evaluate(`setAction(${index},${JSON.stringify(action)});document.getElementById('message').hidden=true;testButtons()[${index}].click();`);
     await wait('!document.getElementById("message").hidden && document.getElementById("message").textContent.includes("テストを開始")');
   }
-  check(testedActions.slice(-3).join(',')===cardActions.join(',') && state.buttons.length===9,
+  check(testedActions.slice(-3).join(',')===cardActions.join(',') && state.buttons[9].shortAction==='none',
     'each test button previews its selected action without saving the assignment');
   await evaluate(`config.macros.find(macro=>macro.id==='maps').steps[0].key=35;
     setAction(2,'maps');testButtons()[2].click();`);
@@ -249,12 +358,14 @@ try{
   await evaluate(`
     document.querySelector(newCard+' details').open=true;
     fill(newCard,'ボタン名','追加したボタン');fill(newCard,'中心値',180);fill(newCard,'許容幅 ±',12);
-    document.getElementById('save').click();
+    document.querySelector(newCard+' .save-item').click();
   `);
   await wait('!dirty');
   check(state.buttons[9].name==='追加したボタン' && state.buttons[9].center===180 && state.buttons[9].tolerance===12 && state.buttons[9].shortAction==='play_pause',
     'the captured card can be edited and saved with its action');
-  await evaluate(`config.buttons.pop();renderButtons();document.getElementById('save').click();`);await wait('!dirty');
+  await evaluate(`document.querySelector(newCard+' .card-heading button').click();`);
+  await wait('!document.querySelector(newCard) && !dirty');
+  check(state.buttons.length===9,'confirmed deletion immediately removes the saved button');
   key2Millivolts=3100;
   await wait('currentStatus.readings[1].mv===3100');
   const pausesBeforeIdleCapture=inputModeRequests.length;
@@ -272,7 +383,7 @@ try{
       config.channels[0].idleCenter===3050 && config.channels[1].idleCenter===3100 &&
       idleFields.map(row=>row.querySelector('input').value).join(',')==='3050,3100'`),
     'both idle capture buttons update their fields immediately without a modal');
-  await evaluate(`document.getElementById('save').click();`);await wait('!dirty');
+  await evaluate(`document.getElementById('save-inputs').click();`);await wait('!dirty');
   check(inputModeRequests.length===pausesBeforeIdleCapture && state.channels[0].idleCenter===3050 && state.channels[1].idleCenter===3100,
     'idle values can be saved without pausing Bluetooth');
   await evaluate(`document.querySelector('[data-tab="macros"]').click();`);
@@ -282,11 +393,14 @@ try{
     [...document.querySelectorAll('#macro-cards .macro-card:nth-child(2) .modifiers input')].slice(0,2).forEach(input=>input.click());
     initial[0]==='送信するキー Control＋Option＋Shift＋1' && initial[1]==='送信するキー Control＋Option＋Shift＋2' &&
     macroShortcut()[1]==='送信するキー Option＋1'`), 'preset chords reflect the actual key and modifiers');
-  await evaluate(`document.getElementById('discard').click();document.getElementById('add-macro').click();`);
+  await evaluate(`document.querySelector('[data-macro-id="youtube"] .cancel-item').click();document.getElementById('add-macro').click();`);
   check(await evaluate('config.macros.length===6 && document.querySelectorAll(".macro-card").length===6'),'custom macros can be added');
-  await evaluate(`document.getElementById('save').click()`);await wait('!dirty');
-  await evaluate(`document.querySelectorAll('#macro-cards .macro-card')[0].querySelector('.actions button:last-child').click()`);
+  await evaluate(`fill('#macro-cards','マクロ名','未保存マクロ');[...document.querySelectorAll('#macro-cards .save-item')].at(-1).click()`);
+  await wait('!saving && saved.macros.length===6');
+  check(state.macros[0].name!=='未保存マクロ' && await evaluate('dirty'),'saving a custom macro leaves another edited macro unsaved');
+  await evaluate(`document.querySelector('[data-macro-id="maps"] .test-macro').click()`);
   await wait('document.getElementById("message").textContent.includes("テストを開始")');check(testedActions.includes('macro:maps'),'macro test submits the saved macro action');
+  await evaluate(`document.querySelector('[data-macro-id="maps"] .cancel-item').click()`);
   await evaluate(`document.querySelector('[data-tab="settings"]').click();document.getElementById('passcode').value='4826';document.getElementById('passcode-form').requestSubmit();`);
   await wait('currentStatus.passcodeSet===true');check(await evaluate('document.getElementById("passcode").value==="4826" && document.getElementById("passcode-feedback").textContent.includes("保存")'),'passcode field remains populated with a saved indicator');
   check(await evaluate(`api('backup').then(data=>!('passcode' in data)&&!('wifiPassword' in data)&&!('adminPassword' in data))`),'backup contains no secret fields');
@@ -300,7 +414,7 @@ try{
   await call('DOM.setFileInputFiles',{nodeId:input.nodeId,files:[importFile]});
   await wait('document.getElementById("message").textContent.includes("不正")');
   check(await evaluate('config.name==="復元テスト" && config.channels[0]!==null'),'malformed import leaves the current draft intact');
-  await evaluate(`document.getElementById('discard').click();document.querySelector('[data-tab="buttons"]').click()`);
+  await evaluate(`document.getElementById('cancel-preview').click();document.querySelector('[data-tab="buttons"]').click()`);
   await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   await new Promise(r=>setTimeout(r,300));
   check(await evaluate('document.documentElement.scrollWidth <= innerWidth'),'mobile viewport has no horizontal page overflow');
@@ -313,7 +427,7 @@ try{
   await evaluate(`document.querySelector('[data-tab="settings"]').click();globalThis.editingInput=document.querySelector('#general-fields input[type=text]');editingInput.focus();editingInput.value='端末で入力中';editingInput.dispatchEvent(new Event('input',{bubbles:true}));`);
   await new Promise(r=>setTimeout(r,650));
   check(await evaluate('document.activeElement===editingInput && editingInput.value==="端末で入力中"'),'telemetry polling preserves text field focus and draft input');
-  await evaluate(`document.getElementById('save').click()`);await wait('!dirty');
+  await evaluate(`document.getElementById('save-general').click()`);await wait('!dirty');
   check(state.name==='端末で入力中','local network can save configuration without Web login');
   await evaluate(`
     document.getElementById('wifi-ssid').value='TestHome24';document.getElementById('wifi-ssid').dispatchEvent(new Event('input',{bubbles:true}));
@@ -322,19 +436,47 @@ try{
   `);
   await new Promise(r=>setTimeout(r,650));
   check(await evaluate('document.getElementById("wifi-password").value==="test-pass-123" && document.getElementById("passcode").value==="5931" && document.activeElement===document.getElementById("passcode")'),'Wi-Fi and passcode inputs remain populated and focused during polling');
-  check(await evaluate('wifiDirty && passcodeDirty && !document.getElementById("save").disabled'),'footer save includes Wi-Fi and passcode edits');
+  check(await evaluate('wifiDirty && passcodeDirty && document.getElementById("save-general").disabled'),'Wi-Fi and passcode drafts have independent controls');
   await evaluate(`document.getElementById('show-wifi-password').click();document.getElementById('show-passcode').click();`);
   check(await evaluate('document.getElementById("wifi-password").type==="text" && document.getElementById("passcode").type==="text"'),'entered Wi-Fi password and passcode can be revealed');
-  await evaluate(`globalThis.generalInput=document.querySelector('#general-fields input[type=text]');generalInput.value='接続設定中';generalInput.dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('save').click()`);await wait('!hasChanges() && currentStatus.wifiSavedSsid==="TestHome24"');
-  check(state.ssid==='TestHome24'&&saveOrder.slice(-2).join(',')==='passcode,wifi','footer saves passcode before changing the Wi-Fi connection');
+  const beforeIndependentSave=saveOrder.length;
+  await evaluate(`fill('#general-fields','設定名','接続設定中');document.getElementById('save-general').click()`);
+  await wait('!dirty');
+  check(state.name==='接続設定中' && saveOrder.length===beforeIndependentSave && await evaluate('wifiDirty && passcodeDirty'),
+    'saving device settings does not submit Wi-Fi or passcode drafts');
+  await evaluate(`document.getElementById('passcode-form').requestSubmit()`);await wait('!passcodeDirty');
+  check(await evaluate('wifiDirty'),'saving the passcode leaves the Wi-Fi draft intact');
+  await evaluate(`document.getElementById('wifi-form').requestSubmit()`);await wait('!hasChanges() && currentStatus.wifiSavedSsid==="TestHome24"');
+  check(state.ssid==='TestHome24'&&saveOrder.at(-1)==='wifi','the Wi-Fi form saves and starts the connection');
   check(await evaluate('document.getElementById("wifi-password").value==="test-pass-123" && document.getElementById("passcode").value==="5931"'),'saving does not clear either secret input');
   check(await evaluate('document.getElementById("wifi-saved-state").textContent.includes("TestHome24") && document.getElementById("wifi-connection-state").textContent.includes("接続中")'),'Wi-Fi saved state is distinct from connection progress');
   wifiState='failed';wifiError='認証に失敗しました。パスワードを確認してください。';
   await wait('document.getElementById("wifi-connection-state").textContent.includes("認証に失敗")');
-  check(await evaluate('document.getElementById("wifi-saved-state").textContent.includes("保存済み") && document.getElementById("wifi-lan-access").hidden'),'failed connection still shows saved configuration and hides invalid LAN URL');
+  check(await evaluate('document.getElementById("wifi-saved-state").textContent.includes("保存済み") && document.getElementById("wifi-lan-access").hidden && document.getElementById("wifi-connection-state").classList.contains("error") && document.getElementById("wifi-status-wait").hidden'),'confirmed router failure is red and hides the LAN URL while keeping the saved setting');
   await evaluate(`document.getElementById('wifi-reconnect').click()`);await wait('currentStatus.wifiState==="connecting"');check(wifiAttempts===2,'saved Wi-Fi settings can be retried explicitly');
   wifiState='connected';wifiError='';await wait('!document.getElementById("wifi-lan-access").hidden');
   check(await evaluate('document.getElementById("wifi-lan-url").textContent==="http://192.168.0.45/" && document.getElementById("wifi-lan-detail").textContent.includes("TestHome24")'),'successful connection displays the router-side PC URL and network name');
+  statusDelayMs=1800;
+  await wait('document.getElementById("live-connection").textContent==="測定値の受信に時間がかかりました"');
+  check(await evaluate(`document.getElementById('connection').textContent==='BLE 操作可能' &&
+    document.getElementById('wifi-status-wait').hidden && !hasFreshReading()`),
+    'a slow status response updates BLE state without allowing late measurements to be captured');
+  statusDelayMs=0;
+  await wait('hasFreshReading() && document.getElementById("live-connection").hidden');
+  failStatus=true;
+  await wait('!document.getElementById("wifi-status-wait").hidden');
+  check(await evaluate(`document.getElementById('wifi-connection-state').textContent.includes('接続成功') &&
+    document.getElementById('wifi-connection-state').classList.contains('stale') &&
+    !document.getElementById('wifi-connection-state').classList.contains('error') &&
+    document.getElementById('connection').textContent==='本体との通信待ち' &&
+    document.getElementById('ble-state').textContent==='操作可能（前回）' &&
+    document.getElementById('ble-keyboard').textContent==='使用可能' && document.getElementById('reconnect-ble').disabled`),
+    'a failed browser request shows response pending and preserves the last confirmed router and Bluetooth states');
+  failStatus=false;
+  wifiDisconnectCount=1; wifiLastDisconnectReason=200;
+  await wait('document.getElementById("wifi-status-wait").hidden && !document.getElementById("wifi-disconnects").hidden');
+  check(await evaluate('document.getElementById("wifi-connection-state").classList.contains("good") && document.getElementById("wifi-disconnects").textContent.includes("理由コード 200")'),
+    'successful status clears the waiting message and shows the device-reported router disconnect after recovery');
   await evaluate(`document.getElementById('wifi-panel').scrollIntoView()`);
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'wifi-connected.png'),Buffer.from(shot.data,'base64'));
   await call('Page.reload');await wait('!document.getElementById("workspace").hidden && currentStatus?.wifiSavedSsid==="TestHome24" && document.getElementById("wifi-password").value===""');
@@ -422,7 +564,7 @@ try{
   check(await evaluate('document.getElementById("field-keyboard").hidden && currentStatus.bleReady'),
     'replacing an edited field returns the fallback keyboard and resumes output without reconnecting');
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'setup-direct.png'),Buffer.from(shot.data,'base64'));
-  await evaluate(`document.getElementById('discard').click()`);
+  await evaluate(`document.getElementById('cancel-wifi').click();document.getElementById('cancel-passcode').click()`);
   check(await evaluate(`document.getElementById('firmware-version').textContent==='1.0.1' &&
     document.getElementById('firmware-repository').textContent==='suzuking001/steering_sw' &&
     document.getElementById('firmware-check').disabled && !document.querySelector('#firmware-panel input')`),
@@ -441,10 +583,10 @@ try{
   await wait('currentStatus.firmware.stage==="checking"');
   Object.assign(firmware,{stage:'available',message:'',availableVersion:'1.0.2',size:1500000});
   await wait('!document.getElementById("firmware-install").hidden');
-  await evaluate(`setDirty();document.getElementById('firmware-install').click()`);
+  await evaluate(`fill('#general-fields','設定名','未保存の設定名');document.getElementById('firmware-install').click()`);
   check(firmwareRequests.length===2 && await evaluate('document.getElementById("firmware-request-feedback").textContent.includes("未保存")'),
     'unsaved edits are protected from an update restart');
-  await evaluate(`markSaved();document.getElementById('firmware-install').click()`);
+  await evaluate(`document.getElementById('cancel-general').click();document.getElementById('firmware-install').click()`);
   await wait('currentStatus.firmware.stage==="downloading"');
   firmware.received=750000;
   await wait('document.getElementById("firmware-progress").value===50');

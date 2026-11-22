@@ -1,9 +1,11 @@
 #include "runtime.h"
+#include <esp_adc/adc_cali_scheme.h>
 namespace sw {
 Runtime runtime;
 namespace {
-constexpr int pins[] = {36, 39};
-constexpr int accPin = 34, ledPin = 25;
+constexpr int pins[kChannels + 1] = {36, 39, 34};
+constexpr int ledPin = 25;
+constexpr uint32_t historyIntervalMs = 25;
 struct Guard {
   SemaphoreHandle_t m;
   explicit Guard(SemaphoreHandle_t mutex) : m(mutex) { xSemaphoreTake(m, portMAX_DELAY); }
@@ -12,25 +14,55 @@ struct Guard {
 int median(const int* values) { int v[5]; std::copy(values, values + 5, v); std::sort(v, v + 5); return v[2]; }
 Step chord(int key, int modifiers) { Step s; s.type = "chord"; s.key = key; s.modifiers = modifiers; return s; }
 }
+bool Runtime::beginAdc() {
+  adc_oneshot_unit_init_cfg_t unit = {};
+  unit.unit_id = ADC_UNIT_1;
+  if (adc_oneshot_new_unit(&unit, &adc_) != ESP_OK) return false;
+  const adc_oneshot_chan_cfg_t channelConfig = {ADC_ATTEN_DB_12, ADC_BITWIDTH_12};
+  for (int i = 0; i <= kChannels; ++i) {
+    adc_unit_t pinUnit;
+    if (adc_oneshot_io_to_channel(pins[i], &pinUnit, &adcChannels_[i]) != ESP_OK || pinUnit != ADC_UNIT_1 ||
+        adc_oneshot_config_channel(adc_, adcChannels_[i], &channelConfig) != ESP_OK) {
+      adc_oneshot_del_unit(adc_);
+      adc_ = nullptr;
+      return false;
+    }
+  }
+  const adc_cali_line_fitting_config_t cal = {ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_BITWIDTH_12, 1100};
+  if (adc_cali_create_scheme_line_fitting(&cal, &calibration_) != ESP_OK) {
+    log("ADCの電圧校正を開始できません。ADC値でのみ判定できます");
+  }
+  return true;
+}
+int Runtime::millivolts(int raw) const {
+  int mv = 0;
+  return raw >= 0 && calibration_ && adc_cali_raw_to_voltage(calibration_, raw, &mv) == ESP_OK ? mv : -1;
+}
 bool Runtime::begin(const Config& cfg, const String& passcode) {
   mutex_ = xSemaphoreCreateMutex();
   if (!mutex_) return false;
   cfg_ = cfg; passcode_ = passcode;
   pinMode(ledPin, OUTPUT); digitalWrite(ledPin, LOW);
-  analogReadResolution(12);
-  for (int pin : pins) { pinMode(pin, INPUT); analogSetPinAttenuation(pin, ADC_11db); }
-  pinMode(accPin, INPUT); analogSetPinAttenuation(accPin, ADC_11db);
+  if (!beginAdc()) { vSemaphoreDelete(mutex_); mutex_ = nullptr; return false; }
   hidEpoch_ = hidState.epoch;
   BaseType_t created = xTaskCreatePinnedToCore([](void* arg) {
     auto self = static_cast<Runtime*>(arg);
     TickType_t wake = xTaskGetTickCount();
     for (;;) { self->tick(); vTaskDelayUntil(&wake, pdMS_TO_TICKS(5)); }
   }, "switch-input", 12288, this, 2, nullptr, 1);
-  if (created != pdPASS) { vSemaphoreDelete(mutex_); mutex_ = nullptr; return false; }
+  if (created != pdPASS) {
+    if (calibration_) adc_cali_delete_scheme_line_fitting(calibration_);
+    adc_oneshot_del_unit(adc_);
+    vSemaphoreDelete(mutex_);
+    return false;
+  }
   log("起動。未押下状態を確認してから操作を受け付けます");
   return true;
 }
-bool Runtime::hasSamples() { Guard lock(mutex_); return samples_ != 0; }
+bool Runtime::hasSamples() {
+  Guard lock(mutex_);
+  return readings_[0].raw >= 0 && readings_[1].raw >= 0;
+}
 bool Runtime::stopHidForFirmware() {
   Guard lock(mutex_);
   runner_.cancel();
@@ -136,11 +168,15 @@ void Runtime::stopLearning() {
 }
 void Runtime::tick() {
   // ADC hardware is accessed only by this task, never by the HTTP task.
-  int raw[kChannels], mv[kChannels];
-  for (int i = 0; i < kChannels; ++i) { raw[i] = analogRead(pins[i]); mv[i] = analogReadMilliVolts(pins[i]); }
-  int accMv = analogReadMilliVolts(accPin);
+  int raw[kChannels + 1];
+  for (int i = 0; i <= kChannels; ++i) {
+    if (adc_oneshot_read(adc_, adcChannels_[i], &raw[i]) != ESP_OK) raw[i] = -1;
+  }
+  const int accMv = millivolts(raw[kChannels]);
+  const uint32_t acquiredAt = millis();
   Guard lock(mutex_);
-  const uint32_t now = millis(); ++samples_; accMv_ = accMv;
+  const uint32_t now = millis();
+  ++samples_; sampled_ = true; sampleAt_ = acquiredAt; accMv_ = accMv;
   const bool ready = cfg_.ble.enabled && hidReady(); const uint32_t epoch = hidState.epoch;
   if (ready != ready_ || epoch != hidEpoch_) {
     runner_.cancel(); resetEngines(); hidEpoch_ = epoch; ready_ = ready;
@@ -151,14 +187,24 @@ void Runtime::tick() {
   bool pressed = false;
   for (int i = 0; i < kChannels; ++i) {
     auto& r = readings_[i]; const auto& ch = cfg_.channels[i];
-    r.raw = raw[i]; r.mv = mv[i];
-    if (!r.initialized) {
-      std::fill(r.rawWindow, r.rawWindow + 5, raw[i]); std::fill(r.mvWindow, r.mvWindow + 5, mv[i]); r.initialized = true;
+    r.raw = raw[i];
+    if (r.raw >= 0) {
+      if (!r.initialized) {
+        std::fill(r.rawWindow, r.rawWindow + 5, r.raw);
+        r.initialized = true;
+      }
+      r.rawWindow[r.cursor] = r.raw;
+      r.cursor = (r.cursor + 1) % 5;
+      r.filtered = median(r.rawWindow);
+      r.filteredMv = millivolts(r.filtered);
+      r.lastValidAt = acquiredAt;
+    } else {
+      r.filtered = r.filteredMv = -1;
+      if (uint32_t(acquiredAt - r.lastValidAt) >= 25) r.initialized = false;
     }
-    r.rawWindow[r.cursor] = raw[i]; r.mvWindow[r.cursor] = mv[i]; r.cursor = (r.cursor + 1) % 5;
-    r.filtered = median(r.rawWindow); r.filteredMv = median(r.mvWindow);
     r.ohm = resistance(r.filteredMv, ch.supplyMv, ch.pullup, r.filtered >= 4090);
-    const double value = readingValue(ch, r.filtered, r.filteredMv, r.ohm);
+    const double value = readingValue(ch, r.filtered < 0 ? NAN : r.filtered,
+                                      r.filteredMv < 0 ? NAN : r.filteredMv, r.ohm);
     r.recognized = classify(cfg_, i, value, r.recognized);
     pressed |= r.recognized >= 0;
     if (learning_.active && learning_.channel == i && uint32_t(now - learning_.started) >= 400) {
@@ -177,6 +223,13 @@ void Runtime::tick() {
       });
     } else engines_[i].reset();
   }
+  if (!historyCount_ || uint32_t(acquiredAt - history_[(historyNext_ + kHistorySize - 1) % kHistorySize].at) >= historyIntervalMs) {
+    auto& sample = history_[historyNext_];
+    sample.at = acquiredAt;
+    for (int i = 0; i < kChannels; ++i) sample.mv[i] = readings_[i].filteredMv;
+    historyNext_ = (historyNext_ + 1) % kHistorySize;
+    if (historyCount_ < kHistorySize) ++historyCount_;
+  }
   if (learning_.active && uint32_t(now - learning_.started) >= 2400) {
     auto& l = learning_; l.active = false; l.done = true; resetEngines();
     if (l.count < 100 || l.invalid > 0) l.error = "有効な測定が不足しています。ADC方式または配線を確認してください";
@@ -184,7 +237,7 @@ void Runtime::tick() {
       l.error = "値が安定していません。ボタンを押し続けて再測定してください";
     logLocked(l.error.isEmpty() ? "学習完了。提案値はWeb画面で確認・適用してください" : l.error);
   }
-  if (cfg_.accEnabled && canSend) {
+  if (cfg_.accEnabled && canSend && accMv_ >= 0) {
     if (acc_.update(now, accMv_, cfg_.accThresholdMv, cfg_.accDebounceMs)) {
       runner_.cancel(); String error;
       if (!actionLocked("lock", Gesture::Short, false, error)) logLocked("ACCロック送信失敗: " + error);
@@ -193,11 +246,16 @@ void Runtime::tick() {
   digitalWrite(ledPin, pressed || learning_.active || runner_.busy() ? HIGH : LOW);
 }
 void Runtime::status(JsonObject o, bool includeLogs) {
+  bool advertising = false;
+  int bonds = -1;
+  if (NimBLEDevice::isInitialized()) {
+    advertising = NimBLEDevice::getAdvertising()->isAdvertising();
+    bonds = NimBLEDevice::getNumBonds();
+  }
   Guard lock(mutex_);
-  o["uptimeMs"] = millis(); o["samples"] = samples_; o["outputEnabled"] = cfg_.outputEnabled;
+  o["outputEnabled"] = cfg_.outputEnabled;
   o["bleConnected"] = hidState.connected.load(); o["bleReady"] = hidReady(); o["busy"] = runner_.busy();
   o["bleSuspended"] = hidState.suspended.load();
-  o["inputModePaused"] = inputModePaused_;
   auto ble = o["ble"].to<JsonObject>();
   ble["name"] = cfg_.ble.name;
   ble["enabled"] = cfg_.ble.enabled;
@@ -206,29 +264,18 @@ void Runtime::status(JsonObject o, bool includeLogs) {
   ble["mediaReady"] = hidMediaReady();
   ble["protocolMode"] = hidState.bootMode ? "boot" : "report";
   ble["reportMapRead"] = hidState.reportMapRead.load();
+  ble["securityError"] = hidState.securityError.load();
   ble["disconnectReason"] = hidState.disconnectReason.load();
   ble["automaticReconnects"] = hidState.automaticReconnects.load();
   ble["serviceRefreshes"] = hidState.serviceRefreshes;
+  ble["serviceRefreshConfirmations"] = hidState.serviceRefreshConfirmations.load();
   ble["automaticRetryUsed"] = hidAutomaticRetryUsed();
-  if (NimBLEDevice::isInitialized()) {
-    const bool advertising = NimBLEDevice::getAdvertising()->isAdvertising();
-    ble["advertising"] = advertising;
-    if (advertising) ble["advertisingIntervalMs"] = hidState.advertisingIntervalUnits * 0.625;
-    ble["bonds"] = NimBLEDevice::getNumBonds();
-  } else {
-    ble["advertising"] = false;
-    ble["bonds"] = nullptr;
-  }
-  o["passcodeSet"] = !passcode_.isEmpty(); o["accMv"] = accMv_;
-  auto rs = o["readings"].to<JsonArray>();
-  for (int i = 0; i < kChannels; ++i) {
-    const auto& r = readings_[i]; auto a = rs.add<JsonObject>();
-    a["name"] = cfg_.channels[i].name; a["mode"] = cfg_.channels[i].mode; a["pin"] = pins[i];
-    a["raw"] = r.raw; a["adc"] = r.filtered; a["mv"] = r.filteredMv;
-    if (std::isfinite(r.ohm)) a["ohm"] = r.ohm; else a["ohm"] = nullptr;
-    if (r.recognized >= 0) { a["button"] = cfg_.buttons[r.recognized].name; a["buttonId"] = cfg_.buttons[r.recognized].id; }
-    else { a["button"] = r.recognized == kIdle ? "未押下" : "範囲外 / 測定不可"; a["buttonId"] = nullptr; }
-  }
+  ble["automaticRetryExhausted"] = hidAutomaticRetryExhausted();
+  ble["advertising"] = advertising;
+  if (advertising) ble["advertisingIntervalMs"] = hidState.advertisingIntervalUnits * 0.625;
+  if (bonds >= 0) ble["bonds"] = bonds; else ble["bonds"] = nullptr;
+  o["passcodeSet"] = !passcode_.isEmpty();
+  if (accMv_ >= 0) o["accMv"] = accMv_; else o["accMv"] = nullptr;
   auto l = o["learning"].to<JsonObject>();
   l["active"] = learning_.active; l["done"] = learning_.done; l["channel"] = learning_.channel;
   l["count"] = learning_.count; l["error"] = learning_.error;
@@ -241,6 +288,55 @@ void Runtime::status(JsonObject o, bool includeLogs) {
     for (size_t j = 0; j < logCount_; ++j) {
       const auto& entry = logs_[(logCursor_ + 32 - logCount_ + j) % 32];
       auto a = logs.add<JsonObject>(); a["at"] = entry.at; a["message"] = entry.message;
+    }
+  }
+}
+void Runtime::writeReadingsLocked(JsonObject o) {
+  o["samples"] = samples_; o["inputModePaused"] = inputModePaused_;
+  if (sampled_) o["sampleAtMs"] = sampleAt_; else o["sampleAtMs"] = nullptr;
+  auto rs = o["readings"].to<JsonArray>();
+  for (int i = 0; i < kChannels; ++i) {
+    const auto& r = readings_[i]; const auto& ch = cfg_.channels[i];
+    auto a = rs.add<JsonObject>();
+    a["name"] = ch.name; a["mode"] = ch.mode; a["pin"] = pins[i];
+    if (r.raw >= 0) a["raw"] = r.raw; else a["raw"] = nullptr;
+    if (r.filtered >= 0) a["adc"] = r.filtered; else a["adc"] = nullptr;
+    if (r.filteredMv >= 0) a["mv"] = r.filteredMv; else a["mv"] = nullptr;
+    const bool ohmValid = std::isfinite(r.ohm);
+    if (ohmValid) a["ohm"] = r.ohm; else a["ohm"] = nullptr;
+    a["ohmState"] = ohmValid ? "ok" : !sampled_ ? "waiting" : r.raw < 0 ? "adc_error" :
+                     r.filtered >= 4090 ? "adc_saturated" : r.filteredMv < 0 ? "voltage_unavailable" : "supply_limit";
+    if (r.recognized >= 0) {
+      a["button"] = cfg_.buttons[r.recognized].name;
+      a["buttonId"] = cfg_.buttons[r.recognized].id;
+    } else {
+      const bool valid = ch.mode == "ohm" ? ohmValid : ch.mode == "mv" ? r.filteredMv >= 0 : r.filtered >= 0;
+      a["button"] = r.recognized == kIdle ? "未押下" : !sampled_ ? "測定待ち" : valid ? "判定範囲外" : "測定不可";
+      a["buttonId"] = nullptr;
+    }
+  }
+}
+void Runtime::liveReadings(JsonObject o, bool includeHistory, uint32_t after) {
+  VoltageSample points[kHistorySize];
+  size_t count = 0;
+  {
+    Guard lock(mutex_);
+    o["uptimeMs"] = millis();
+    writeReadingsLocked(o);
+    if (includeHistory) {
+      const size_t first = (historyNext_ + kHistorySize - historyCount_) % kHistorySize;
+      for (size_t i = 0; i < historyCount_; ++i) {
+        const auto& p = history_[(first + i) % kHistorySize];
+        if (int32_t(p.at - after) > 0) points[count++] = p;
+      }
+    }
+  }
+  auto history = o["history"].to<JsonArray>();
+  for (size_t i = 0; i < count; ++i) {
+    auto point = history.add<JsonArray>();
+    point.add(points[i].at);
+    for (int mv : points[i].mv) {
+      if (mv >= 0) point.add(mv); else point.add(nullptr);
     }
   }
 }
