@@ -1,0 +1,20 @@
+ESP-WROOM-32 ステアリングスイッチ基板 Rev. 0.3
+発注と初回動作確認
+
+発注データ
+Gerbers.zip を基板製造ページにアップロードします。BOM.csv と CPL.csv は実装サービスの入力です。
+基板は FR-4、4層、75 × 55 mm、板厚1.6 mm、銅箔1 oz想定です。ガーバーには銅箔4層、レジスト、シルク、表面ペースト、外形、PTH・NPTHドリルが含まれます。最小ドリル径は0.20 mmです。
+全実装部品は表面側です。JLCPCBでは Standard PCBA を選び、実装プレビューで U1 が部品選択済みであることと、全極性部品の向きを照合してください。
+U1 は Espressif ESP32-WROOM-32-N4（JLCPCB C82899）です。アンテナ部分は板端から約6 mm張り出します。面付け・治具でこの部分に干渉しないよう、実装業者に伝えてください。
+U2 は LTC4425EMSE または同じパッケージの LTC4425IMSE です。C1・C2 は Eaton HV0820-2R7305-R など同一型番の2.7 V / 3 Fで、実測容量差5%以内のペアを指定します。J1・J3、D1、C1・C2は挿入部品なので、挿入実装サービスと部材手配を確認します。
+R6 は900 kΩ・1%の0603です。手配が難しい場合は、仕様範囲内の898 kΩ・0.1%（例 KOA RN73R1JTTD8983B25）で代替できます。BOMのLCSC番号と部品在庫は発注画面で照合してください。
+
+実装業者への指示例
+Assemble U1 as Espressif ESP32-WROOM-32-N4 (C82899) on the top side. The antenna end intentionally overhangs the board edge by approximately 6 mm. Keep the antenna edge clear of panel rails and fixtures. Match C1 and C2 to within 5% capacitance and follow their pad-1 positive polarity. Confirm the pin-1 and polarity orientations in the placement preview.
+
+初回通電と書き込み
+給電はJ2のUSB Type-C 5 Vです。USB-C同士のケーブルと、5 Vで1.5 A以上を通知する電源を使用します。J1は受動抵抗ラダー専用で、ピン1がKEY1、ピン2がKEY2、ピン3がGNDです。車両の12 V電源を接続しないでください。ACCは未実装です。
+J3はピン1が基板TX、ピン2が基板RX、ピン3がGNDです。外付けUSB-UARTの3.3 Vロジックを接続し、電源はJ2から供給します。BOOTを押しながらRESETを押して離し、その後BOOTを離すと書き込みモードに入ります。
+基板のLEDはGPIO12です。現在の既存ファームウェアのLEDはGPIO25設定なので、この基板用にLED出力をGPIO12に設定して書き込みます。
+最初の試作で、セルごとの電圧、3.3 V電源、起動、充電電流、USB抜去時の保持時間と逆流、BLE動作を確認します。PCBのKiCad DRCは違反0件・未接続0件です。
+

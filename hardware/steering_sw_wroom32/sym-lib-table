@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "SteeringSW")(type "KiCad")(uri "${KIPRJMOD}/SteeringSW.kicad_sym")(options "")(descr "Steering switch project symbols"))
+)
