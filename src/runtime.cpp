@@ -109,14 +109,23 @@ void Runtime::setInputMode(bool enabled) {
   resetEngines();
   logLocked(enabled ? "設定画面の操作中はキー送信を一時停止します" : "キー送信の一時停止を解除しました");
 }
-bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool physical, String& error) {
-  if (action == "none") return true;
+bool Runtime::canSendLocked(String& error) {
   if (!cfg_.outputEnabled) { error = "キー送信が無効です"; return false; }
   if (!cfg_.ble.enabled) { error = "Bluetoothが無効です"; return false; }
   if (learning_.active) { error = "学習中は送信できません"; return false; }
   if (inputModePaused_) { error = "キー送信が一時停止中です。開いている設定画面で入力や学習を終了してください"; return false; }
   if (!hidReady()) { error = "BLEが操作可能な状態ではありません"; return false; }
   if (runner_.busy()) { error = "操作実行中のため追加操作を破棄しました"; return false; }
+  return true;
+}
+bool Runtime::startStepsLocked(std::vector<Step>&& steps, const char* label, String& error) {
+  if (!runner_.start(std::move(steps))) { error = "この操作に必要なキー通知が準備中です"; return false; }
+  logLocked(String("送信開始: ") + label);
+  return true;
+}
+bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool physical, String& error) {
+  if (action == "none") return true;
+  if (!canSendLocked(error)) return false;
   std::vector<Step> steps;
   if (action == "passcode") {
     if (!physical || gesture != Gesture::Long) { error = "パスコードは実ボタンの長押し専用です"; return false; }
@@ -144,8 +153,7 @@ bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool phys
     }
   }
   if (steps.empty()) { error = "操作の参照先がありません"; return false; }
-  if (!runner_.start(std::move(steps))) { error = "この操作に必要なキー通知が準備中です"; return false; }
-  logLocked(String("送信開始: ") + action.c_str() + "（成功状態は接続先の端末で確認）"); return true;
+  return startStepsLocked(std::move(steps), action.c_str(), error);
 }
 bool Runtime::test(const std::string& action, String& error) {
   Guard lock(mutex_);
@@ -153,6 +161,10 @@ bool Runtime::test(const std::string& action, String& error) {
     error = "テストできない操作です"; return false;
   }
   return actionLocked(action, Gesture::Short, false, error);
+}
+bool Runtime::testMacro(std::vector<Step>&& steps, String& error) {
+  Guard lock(mutex_);
+  return canSendLocked(error) && startStepsLocked(std::move(steps), "マクロのテスト", error);
 }
 void Runtime::cancel() { Guard lock(mutex_); runner_.cancel(); resetEngines(); logLocked("操作を停止しました"); }
 bool Runtime::startLearning(int channel, String& error) {

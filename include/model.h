@@ -91,6 +91,29 @@ inline bool validId(const std::string& s) {
                          (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
   return true;
 }
+inline const char* validateMacroSteps(const std::vector<Step>& steps) {
+  if (steps.empty() || steps.size() > 32) return "マクロの形式が不正です";
+  uint32_t total = 0;
+  for (const auto& s : steps) {
+    if (s.type == "wait") {
+      if (s.ms > 10000) return "待ち時間は10000ms以内にしてください";
+      total += s.ms;
+    } else if (s.type == "chord") {
+      if (s.key < 4 || s.key > 115 || s.modifiers < 0 || s.modifiers > 255) return "HIDキーコードまたは修飾キーが不正です";
+      total += 60;
+    } else if (s.type == "media") {
+      if (s.usage != 0xE9 && s.usage != 0xEA && s.usage != 0xE2 && s.usage != 0xCD && s.usage != 0xB5 && s.usage != 0xB6 && s.usage != 0xB7)
+        return "未対応のメディアキーです";
+      total += 60;
+    } else if (s.type == "text") {
+      if (s.text.empty() || s.text.size() > 128) return "文字列は1〜128文字にしてください";
+      for (unsigned char ch : s.text) if (ch < 32 || ch > 126) return "文字列入力は半角英数・ASCII記号に対応します";
+      total += s.text.size() * 60;
+    } else return "未対応のマクロステップです";
+  }
+  if (total > 30000) return "マクロの合計実行時間は30秒以内にしてください";
+  return nullptr;
+}
 inline std::string validate(const Config& c) {
   if (c.version != kVersion) return "設定バージョンが対応していません";
   if (c.name.empty() || c.name.size() > 96 || c.ssid.size() > 32) return "設定名またはSSIDの長さが不正です";
@@ -116,27 +139,9 @@ inline std::string validate(const Config& c) {
   if (c.buttons.size() > kMaxButtons || c.macros.size() > 16) return "ボタンまたはマクロの登録数が上限を超えています";
   for (size_t i = 0; i < c.macros.size(); ++i) {
     const auto& m = c.macros[i];
-    if (!validId(m.id) || m.name.empty() || m.name.size() > 96 || m.steps.empty() || m.steps.size() > 32) return "マクロの形式が不正です";
+    if (!validId(m.id) || m.name.empty() || m.name.size() > 96) return "マクロの形式が不正です";
     for (size_t j = 0; j < i; ++j) if (m.id == c.macros[j].id) return "マクロIDが重複しています";
-    uint32_t total = 0;
-    for (const auto& s : m.steps) {
-      if (s.type == "wait") {
-        if (s.ms > 10000) return "待ち時間は10000ms以内にしてください";
-        total += s.ms;
-      } else if (s.type == "chord") {
-        if (s.key < 4 || s.key > 115 || s.modifiers < 0 || s.modifiers > 255) return "HIDキーコードまたは修飾キーが不正です";
-        total += 60;
-      } else if (s.type == "media") {
-        if (s.usage != 0xE9 && s.usage != 0xEA && s.usage != 0xE2 && s.usage != 0xCD && s.usage != 0xB5 && s.usage != 0xB6 && s.usage != 0xB7)
-          return "未対応のメディアキーです";
-        total += 60;
-      } else if (s.type == "text") {
-        if (s.text.empty() || s.text.size() > 128) return "文字列は1〜128文字にしてください";
-        for (unsigned char ch : s.text) if (ch < 32 || ch > 126) return "文字列入力は半角英数・ASCII記号に対応します";
-        total += s.text.size() * 60;
-      } else return "未対応のマクロステップです";
-    }
-    if (total > 30000) return "マクロの合計実行時間は30秒以内にしてください";
+    if (const auto* error = validateMacroSteps(m.steps)) return error;
   }
   int counts[kChannels] = {};
   for (size_t i = 0; i < c.buttons.size(); ++i) {

@@ -16,6 +16,7 @@ let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,r
 let failStatus=false,statusDelayMs=0,wifiDisconnectCount=0,wifiLastDisconnectReason=0;
 const savedWifiRequests=[],saveOrder=[];
 let state=fixture(),learning=null,learningAt=0,passcodeSet=false,testedActions=[];
+const testedMacros=[];
 let macroBusy=false, stopRequests=0;
 let bleAttached=true, bleEncrypted=true, bleReconnectRequests=0;
 let bleKeyboard=true, bleMedia=true, bleProtocol='report', bleMapRead=false, bleDisconnectReason=0;
@@ -108,6 +109,16 @@ const server=http.createServer(async(req,res)=>{
     if(path==='test'){
       if(body.action==='passcode'){reply(409,{error:'テストできない操作です'});return;}
       if(inputModePaused){pausedTestRequests++;reply(409,{error:'キー送信が一時停止中です'});return;}
+      if(Object.hasOwn(body,'steps')){
+        try {
+          execFileSync(binary,['--macro-test'],{input:JSON.stringify(body.steps),stdio:['pipe','pipe','pipe']});
+        } catch (error) {
+          reply(400,JSON.parse(error.stdout));return;
+        }
+        if(!state.outputEnabled){reply(409,{error:'キー送信が無効です'});return;}
+        testedMacros.push(body.steps);
+        reply(200,{message:'テストを開始しました'});return;
+      }
       testedActions.push(body.action);reply(200,{message:'テストを開始しました'});return;
     }
     if(path==='firmware/check'){
@@ -387,19 +398,59 @@ try{
   check(inputModeRequests.length===pausesBeforeIdleCapture && state.channels[0].idleCenter===3050 && state.channels[1].idleCenter===3100,
     'idle values can be saved without pausing Bluetooth');
   await evaluate(`document.querySelector('[data-tab="macros"]').click();`);
-  check(await evaluate(`globalThis.macroShortcut=()=>[...document.querySelectorAll('.macro-shortcut')].map(label=>label.textContent);
+  check(await evaluate(`globalThis.macroShortcut=()=>[...document.querySelectorAll('.shortcut-value')].map(label=>label.textContent);
     const initial=macroShortcut();
     fill('#macro-cards .macro-card:nth-child(2)','HIDキー番号（10進数）',30);
     [...document.querySelectorAll('#macro-cards .macro-card:nth-child(2) .modifiers input')].slice(0,2).forEach(input=>input.click());
-    initial[0]==='送信するキー Control＋Option＋Shift＋1' && initial[1]==='送信するキー Control＋Option＋Shift＋2' &&
-    macroShortcut()[1]==='送信するキー Option＋1'`), 'preset chords reflect the actual key and modifiers');
+    initial[0]==='Control＋Option＋Shift＋1' && initial[1]==='Control＋Option＋Shift＋2' &&
+    macroShortcut()[1]==='Option＋1'`), 'preset chords reflect the actual key and modifiers');
+  await evaluate(`globalThis.siriCard='[data-macro-id="siri"]';
+    document.querySelector(siriCard+' .open-shortcut').click();
+    document.getElementById('shortcut-test').click();`);
+  await wait('document.getElementById("shortcut-feedback").textContent.includes("キー送信が無効")');
+  check(testedMacros.length===0,'the keyboard test respects the saved key output setting');
+  await evaluate(`document.getElementById('shortcut-cancel').click();document.querySelector('[data-tab="settings"]').click();
+    document.getElementById('output-enabled-input').click();document.getElementById('save-general').click();`);
+  await wait('saved.outputEnabled && !saving');
+  await evaluate(`document.querySelector('[data-tab="macros"]').click();document.querySelector(siriCard+' .open-shortcut').click();
+    document.querySelector('#shortcut-keys [data-key="11"]').click();
+    document.querySelector('#shortcut-modifiers [data-modifier="136"]').click();`);
+  check(await evaluate(`document.getElementById('shortcut-selection').textContent==='Control＋Option＋Shift＋Command＋H' &&
+    config.macros.find(m=>m.id==='siri').steps[0].key===32`),'the visual keyboard selects a chord without editing the macro yet');
+  await evaluate(`document.getElementById('shortcut-test').click();`);
+  await wait('document.getElementById("shortcut-feedback").textContent.includes("送信を開始")');
+  await call('Input.dispatchKeyEvent',{type:'keyDown',key:'H',code:'KeyH',modifiers:15});
+  await call('Input.dispatchKeyEvent',{type:'keyUp',key:'H',code:'KeyH',modifiers:15});
+  check(JSON.stringify(testedMacros.at(-1))===JSON.stringify([{type:'chord',key:11,modifiers:15}]) &&
+    await evaluate('document.getElementById("shortcut-received").textContent==="このページで受信: Control＋Option＋Shift＋Command＋H"'),
+    'the selected chord is sent without saving and the page reports actual keyboard events separately');
+  await evaluate(`document.getElementById('shortcut-delay').click();`);
+  await wait('document.getElementById("shortcut-feedback").textContent.includes("5秒後に送信します")');
+  check(testedMacros.at(-1)[0].ms===5000 && testedMacros.at(-1)[1].key===11,
+    'delayed testing requests a device-side wait followed by the selected chord');
+  await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  check(await evaluate('document.getElementById("shortcut-dialog").scrollWidth <= document.getElementById("shortcut-dialog").clientWidth'),
+    'the shortcut keyboard fits a 390 pixel viewport');
+  shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'shortcut-keyboard.png'),Buffer.from(shot.data,'base64'));
+  await call('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
+  await evaluate(`document.getElementById('shortcut-cancel').click();`);
+  check(state.macros[2].steps[0].key===32 && await evaluate('config.macros[2].steps[0].key===32'),
+    'cancel leaves the saved macro and its draft unchanged');
+  await evaluate(`document.querySelector(siriCard+' .open-shortcut').click();document.querySelector('#shortcut-keys [data-key="11"]').click();
+    document.getElementById('shortcut-apply').click();document.querySelector(siriCard+' .test-macro').click();`);
+  await wait('!testPending && document.getElementById("message").textContent.includes("テストを開始")');
+  check(testedMacros.at(-1)[0].key===11 && state.macros[2].steps[0].key===32 &&
+    await evaluate('config.macros[2].steps[0].key===11 && document.querySelector(siriCard+" .shortcut-value").textContent.endsWith("H")'),
+    'applying a key updates the draft and the macro test runs that draft while the stored macro remains intact');
+  await evaluate(`document.querySelector(siriCard+' .cancel-item').click();`);
   await evaluate(`document.querySelector('[data-macro-id="youtube"] .cancel-item').click();document.getElementById('add-macro').click();`);
   check(await evaluate('config.macros.length===6 && document.querySelectorAll(".macro-card").length===6'),'custom macros can be added');
   await evaluate(`fill('#macro-cards','マクロ名','未保存マクロ');[...document.querySelectorAll('#macro-cards .save-item')].at(-1).click()`);
   await wait('!saving && saved.macros.length===6');
   check(state.macros[0].name!=='未保存マクロ' && await evaluate('dirty'),'saving a custom macro leaves another edited macro unsaved');
   await evaluate(`document.querySelector('[data-macro-id="maps"] .test-macro').click()`);
-  await wait('document.getElementById("message").textContent.includes("テストを開始")');check(testedActions.includes('macro:maps'),'macro test submits the saved macro action');
+  await wait('document.getElementById("message").textContent.includes("テストを開始")');
+  check(testedMacros.at(-1)[0].key===30,'macro test submits the card steps even while another card is being edited');
   await evaluate(`document.querySelector('[data-macro-id="maps"] .cancel-item').click()`);
   await evaluate(`document.querySelector('[data-tab="settings"]').click();document.getElementById('passcode').value='4826';document.getElementById('passcode-form').requestSubmit();`);
   await wait('currentStatus.passcodeSet===true');check(await evaluate('document.getElementById("passcode").value==="4826" && document.getElementById("passcode-feedback").textContent.includes("保存")'),'passcode field remains populated with a saved indicator');

@@ -346,10 +346,19 @@ void setupRoutes() {
   });
   server.on("/api/learn/stop", HTTP_POST, [] { if (!allowRequest(true)) { return; } runtime.stopLearning(); response(200, "学習を中止しました"); });
   server.on("/api/test", HTTP_POST, [] {
-    if (!allowRequest(true)) { return; } JsonDocument d; if (!body(d, 128)) return;
-    if (!d["action"].is<const char*>()) { response(400, "操作を指定してください"); return; }
+    if (!allowRequest(true)) { return; } JsonDocument d; if (!body(d, 6144)) return;
     String error;
-    if (!runtime.test(d["action"].as<std::string>(), error)) { response(409, error); return; }
+    bool started;
+    if (d["action"].isUnbound()) {
+      std::vector<Step> steps;
+      if (!readMacroSteps(d["steps"].as<JsonArrayConst>(), steps)) { response(400, "マクロの形式が不正です"); return; }
+      if (const auto* invalid = validateMacroSteps(steps)) { response(400, invalid); return; }
+      started = runtime.testMacro(std::move(steps), error);
+    } else {
+      if (!d["action"].is<const char*>() || !d["steps"].isUnbound()) { response(400, "操作を指定してください"); return; }
+      started = runtime.test(d["action"].as<std::string>(), error);
+    }
+    if (!started) { response(409, error); return; }
     response(200, "操作を開始しました。接続先の端末で結果を確認してください");
   });
   server.on("/api/stop", HTTP_POST, [] { if (!allowRequest(true)) { return; } runtime.cancel(); response(200, "送信を停止しました"); });

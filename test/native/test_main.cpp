@@ -55,11 +55,17 @@ void releaseHid() { reports.push_back("release"); }
 int main(int argc,char** argv) {
   if(argc>1&&std::string(argv[1])=="--fixture") { JsonDocument doc;toJson(defaults(),doc.to<JsonObject>());std::string json;serializeJson(doc,json);std::cout<<json;return 0; }
   const std::string argument = argc>1 ? argv[1] : "";
-  if(argument=="--validate" || argument=="--patch") {
+  if(argument=="--validate" || argument=="--patch" || argument=="--macro-test") {
     std::string data((std::istreambuf_iterator<char>(std::cin)),std::istreambuf_iterator<char>());
     JsonDocument d; Config c; std::string error;
     bool ok=!deserializeJson(d,data);
-    if (ok && argument=="--patch") {
+    if (ok && argument=="--macro-test") {
+      std::vector<Step> steps;
+      ok=readMacroSteps(d.as<JsonArrayConst>(),steps);
+      if (ok) {
+        if (const auto* invalid=validateMacroSteps(steps)) { error=invalid; ok=false; }
+      }
+    } else if (ok && argument=="--patch") {
       Config current;
       ok=fromJson(d["current"].as<JsonVariantConst>(),current,error) &&
         patchConfig(d["changes"].as<JsonObjectConst>(),current,c,error);
@@ -67,7 +73,8 @@ int main(int argc,char** argv) {
       ok=fromJson(d.as<JsonVariantConst>(),c,error);
     }
     JsonDocument out;
-    if(ok)toJson(c,out.to<JsonObject>());else out["error"]=error.empty()?"invalid JSON":error;
+    if(ok&&argument!="--macro-test")toJson(c,out.to<JsonObject>());
+    if(!ok)out["error"]=error.empty()?"マクロまたは設定JSONの形式が不正です":error;
     std::string json;serializeJson(out,json);std::cout<<json;return ok?0:1;
   }
   test("Wi-Fi waits for disconnect before beginning a new connection",[]{NetworkSchedule n;n.configure(0,true);require(n.update(0,true)==NetworkAction::None,"old IP accepted");require(n.phase()==NetworkPhase::Settling,"settle phase lost");require(n.update(299,false)==NetworkAction::None,"begin too early");require(n.update(300,false)==NetworkAction::Begin,"begin missing");});

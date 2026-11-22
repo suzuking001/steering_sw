@@ -135,3 +135,28 @@ dialog::backdrop {
 .config-save [role="status"].error { color: var(--red); }
 #config-preview { margin-top: 16px; }
 #learn-feedback:empty { display: none; }
+
+#shortcut-dialog { width: min(94vw, 620px); }
+.shortcut-row {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.shortcut-row button {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 4px 0;
+  font-size: clamp(.72rem, 2.8vw, .91rem);
+}
+.shortcut-row button[aria-pressed="true"] {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+#shortcut-modifiers { margin-bottom: 10px; }
+#shortcut-feedback { margin: 9px 0 0; }
+#shortcut-received { margin: 0 0 9px; font-weight: 600; }
+#shortcut-received:empty { display: none; }
+#shortcut-dialog .dialog-actions { margin-top: 12px; }
+.shortcut-value { overflow-wrap: anywhere; font-weight: 600; }

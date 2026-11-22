@@ -27,7 +27,10 @@
   </div>
   <div id="button-cards" class="button-grid"></div>
 </section>
-<section id="tab-macros" hidden><div class="section-heading"><div><h2>マクロ</h2><p>キー・メディア操作・文字列・待ち時間を順番に送信します。文字列は半角英数とASCII記号に対応します。</p></div><button id="add-macro">マクロを追加</button></div><details class="panel"><summary>専用ショートカットとキー番号</summary><p>接続先の「ショートカット」でGoogleマップとYouTubeを開く操作を1つずつ作成し、ショートカットアプリから開けることを確認します。「設定 → アクセシビリティ → キーボードと入力 → フルキーボードアクセス」をオンにし、「コマンド」に表示された各ショートカットにキーを割り当てます。</p><p>各カードの「送信するキー」を接続先に登録します。キー登録画面を開いた状態で、別の端末のWeb画面から「保存済みマクロをテスト」を押すと、そのキーを入力できます。初期値はControl＋Option＋Shift＋数字です。1はGoogleマップ、2はYouTube、3はSiri、4はロック、5はアプリ一覧です。</p><p>キー番号はUSB HID Usage IDの10進数です。A=4、H=11、Q=20、1=30、2=31、3=32、4=33、5=34、0=39、Enter=40、Backspace=42、Tab=43、Space=44、→=79、←=80。</p><p>端末の日本語／英語配列や入力モードで記号の入力結果は変わります。新しいマクロは停車中に送信テストしてください。</p></details><div id="macro-cards"></div></section>
+<section id="tab-macros" hidden><div class="section-heading"><div><h2>マクロ</h2><p>キー・メディア操作・文字列・待ち時間を順番に送信します。文字列は半角英数とASCII記号に対応します。</p></div><button id="add-macro">マクロを追加</button></div><details class="panel"><summary>iPadでコマンドにキーを割り当てる</summary>
+<p>「設定 → アクセシビリティ → キーボードと入力 → フルキーボードアクセス → コマンド」で、対象の操作にカードのキーを登録します。Siriはコマンド一覧で選べる場合に登録してください。</p>
+<p>同じiPadで登録するなら「5秒後に送信」を押して登録欄を開きます。別の端末から設定画面を操作する場合は「キーを試す」で送信できます。</p>
+<p>GoogleマップやYouTubeを開くには、「ショートカット」アプリで「Appを開く」を作成し、そのショートカットにキーを割り当てます。</p></details><div id="macro-cards"></div></section>
 <section id="tab-settings" hidden><h2>本体と接続の設定</h2><section class="panel">
   <h3>入力のライブモニター</h3>
   <p id="live-connection" class="muted" role="status">測定待ち</p>
@@ -103,6 +106,22 @@
   <p id="learn-confirmation" class="read-button" hidden></p>
   <p id="learn-feedback" role="status" class="muted"></p>
   <div class="dialog-actions"><button id="close-learn" type="button" class="secondary">キャンセル</button><button id="apply-learn" type="button" hidden>適用して保存</button></div>
+</dialog>
+<dialog id="shortcut-dialog" aria-labelledby="shortcut-title">
+  <h2 id="shortcut-title">ショートカットを選ぶ</h2>
+  <p id="shortcut-selection" class="read-button" role="status"></p>
+  <div id="shortcut-modifiers" class="shortcut-row" role="group" aria-label="修飾キー"></div>
+  <div id="shortcut-keys" role="group" aria-label="キーボード"></div>
+  <div class="actions">
+    <button id="shortcut-test" type="button" class="secondary">キーを試す</button>
+    <button id="shortcut-delay" type="button" class="secondary">5秒後に送信</button>
+  </div>
+  <p id="shortcut-feedback" class="muted" role="status" tabindex="-1"></p>
+  <p id="shortcut-received" class="muted" role="status"></p>
+  <div class="dialog-actions">
+    <button id="shortcut-cancel" type="button" class="secondary">選択を取り消す</button>
+    <button id="shortcut-apply" type="button">このキーを使う</button>
+  </div>
 </dialog>
 <div id="field-keyboard" class="field-keyboard" role="group" aria-label="画面キーボード" hidden></div>
 </div>

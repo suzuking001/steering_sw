@@ -22,7 +22,7 @@ APIは同一機器の `/api/` 以下でJSONを使用します。設定用Wi-Fi�
 | POST | `/api/restore` | `/api/config` の保存と同じ動作 |
 | POST | `/api/learn/start` | `{"channel":0}`。系統0または1を測定 |
 | POST | `/api/learn/stop` | 学習中止 |
-| POST | `/api/test` | `{"action":"macro:maps"}` で保存済み操作をテスト。`{"action":"test_digits"}` で固定の `0123456789` を送信。登録したパスコードの送信は実ボタンの長押し専用 |
+| POST | `/api/test` | `{"action":"macro:maps"}` で保存済み操作をテスト。`{"steps":[{"type":"chord","key":32,"modifiers":7}]}` で編集中のステップを検証して一時実行。設定は保存しない。`{"action":"test_digits"}` で固定の `0123456789` を送信 |
 | PUT | `/api/ble/input-mode` | `{"enabled":true}` でキー送信を一時停止、falseで再開。設定は保存しない |
 | POST | `/api/stop` | 実行中マクロを中止し、入力の再待機。送信の有効設定自体は維持 |
 | PUT | `/api/passcode` | `{"passcode":"数字列"}`。空文字で削除 |

@@ -95,6 +95,19 @@ bool boolean(JsonVariantConst v, bool& out) {
   out = v.as<bool>(); return true;
 }
 }
+bool readMacroSteps(JsonArrayConst in, std::vector<Step>& steps) {
+  if (in.isNull() || in.size() > 32) return false;
+  for (auto v : in) {
+    Step s;
+    if (!str(v["type"], s.type, 8)) return false;
+    if (s.type == "wait" && !duration(v["ms"], s.ms)) return false;
+    if (s.type == "text" && !str(v["text"], s.text, 128)) return false;
+    if (s.type == "chord" && (!integer(v["key"], s.key) || !integer(v["modifiers"], s.modifiers))) return false;
+    if (s.type == "media" && !integer(v["usage"], s.usage)) return false;
+    steps.push_back(std::move(s));
+  }
+  return true;
+}
 bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
   Config c;
   auto fail = [&]() { error = "設定JSONの必須項目または型が不正です"; return false; };
@@ -124,16 +137,8 @@ bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
   }
   for (auto a : in["macros"].as<JsonArrayConst>()) {
     Macro m;
-    if (!str(a["id"], m.id, 24) || !str(a["name"], m.name, 96) || !a["steps"].is<JsonArrayConst>() || a["steps"].size() > 32) return fail();
-    for (auto v : a["steps"].as<JsonArrayConst>()) {
-      Step s;
-      if (!str(v["type"], s.type, 8)) return fail();
-      if (s.type == "wait" && !duration(v["ms"], s.ms)) return fail();
-      if (s.type == "text" && !str(v["text"], s.text)) return fail();
-      if (s.type == "chord" && (!integer(v["key"], s.key) || !integer(v["modifiers"], s.modifiers))) return fail();
-      if (s.type == "media" && !integer(v["usage"], s.usage)) return fail();
-      m.steps.push_back(s);
-    }
+    if (!str(a["id"], m.id, 24) || !str(a["name"], m.name, 96) ||
+        !readMacroSteps(a["steps"].as<JsonArrayConst>(), m.steps)) return fail();
     c.macros.push_back(m);
   }
   auto t = in["timing"];

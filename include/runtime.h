@@ -49,6 +49,8 @@ class Runtime {
   void writeReadingsLocked(JsonObject out);
   void resetEngines();
   void logLocked(const String& message);
+  bool canSendLocked(String& error);
+  bool startStepsLocked(std::vector<Step>&& steps, const char* label, String& error);
   bool actionLocked(const std::string& action, Gesture gesture, bool physical, String& error);
  public:
   bool begin(const Config& cfg, const String& passcode);
@@ -66,6 +68,7 @@ class Runtime {
   bool startLearning(int channel, String& error);
   void stopLearning();
   bool test(const std::string& action, String& error);
+  bool testMacro(std::vector<Step>&& steps, String& error);
   void cancel();
 };
 extern Runtime runtime;
