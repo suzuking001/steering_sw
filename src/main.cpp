@@ -101,6 +101,11 @@ void response(int code, const String& message) {
 void jsonResponse(JsonDocument& d) {
   String json; serializeJson(d, json); server.send(200, "application/json; charset=utf-8", json);
 }
+void configResponse(const Config& config, bool includeDefaults = true) {
+  JsonDocument document;
+  toJson(config, document.to<JsonObject>(), includeDefaults);
+  jsonResponse(document);
+}
 void headers() {
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("X-Content-Type-Options", "nosniff");
@@ -289,20 +294,27 @@ void setupRoutes() {
     response(202, "ファームウェア更新を開始しました");
   });
   server.on("/api/config", HTTP_GET, [] {
-    if (!allowRequest()) { return; } auto c = runtime.config(); JsonDocument d; toJson(c, d.to<JsonObject>()); jsonResponse(d);
+    if (allowRequest()) configResponse(runtime.config());
   });
   auto save = [](bool partial) {
     if (!allowRequest(true)) { return; }
-    JsonDocument d; if (!body(d)) return;
     const auto old = runtime.config();
-    Config c; String error; std::string parseError;
+    Config c;
+    JsonDocument d; if (!body(d)) return;
+    std::string parseError;
     const bool valid = partial ? patchConfig(d.as<JsonObjectConst>(), old, c, parseError) :
       fromJson(d.as<JsonVariantConst>(), c, parseError);
     if (!valid) { response(400, parseError.c_str()); return; }
     if (!partial && d["ble"].isUnbound()) c.ble = old.ble;
     // Wi-Fi changes use /api/wifi so credentials can never leak into backups.
     if (c.ssid != old.ssid) { response(400, "SSIDはWi-Fi設定から変更してください。復元時は現在のSSIDを使用してください"); return; }
+    String error;
     if (!saveConfig(c, error)) { response(507, error); return; }
+    if (partial && d.size() == 1 && d["functionOrder"].is<const char*>()) {
+      runtime.setFunctionOrder(std::move(c.functionOrder));
+      response(200, "設定を保存・適用しました");
+      return;
+    }
     runtime.apply(c);
     bleEnabled = c.ble.enabled;
     if (c.ble.name != old.ble.name && !runtime.reconnectHid()) {
@@ -316,10 +328,19 @@ void setupRoutes() {
   };
   server.on("/api/config", HTTP_PUT, [save] { save(false); });
   server.on("/api/config", HTTP_PATCH, [save] { save(true); });
+  server.on("/api/functions/defaults", HTTP_POST, [] {
+    if (!allowRequest(true)) return;
+    auto c = runtime.config();
+    resetFunctionPresets(c);
+    String error;
+    if (!saveConfig(c, error)) { response(507, error); return; }
+    runtime.apply(c);
+    configResponse(c);
+  });
   server.on("/api/backup", HTTP_GET, [] {
     if (!allowRequest()) { return; }
-    auto c = runtime.config(); JsonDocument d; toJson(c, d.to<JsonObject>());
-    server.sendHeader("Content-Disposition", "attachment; filename=steering-config.json"); jsonResponse(d);
+    server.sendHeader("Content-Disposition", "attachment; filename=steering-config.json");
+    configResponse(runtime.config(), false);
   });
   server.on("/api/restore", HTTP_POST, [save] { save(false); });
   server.on("/api/validate", HTTP_POST, [] {
@@ -328,13 +349,13 @@ void setupRoutes() {
     Config c; std::string error;
     if (!fromJson(d.as<JsonVariantConst>(), c, error)) { response(400, error.c_str()); return; }
     if (d["ble"].isUnbound()) c.ble = runtime.config().ble;
-    JsonDocument out; toJson(c, out.to<JsonObject>()); jsonResponse(out);
+    configResponse(c);
   });
   server.on("/api/defaults", HTTP_GET, [] {
     if (!allowRequest()) { return; }
     const auto current = runtime.config();
     auto c = defaults(); c.ssid = current.ssid; c.ble = current.ble;
-    JsonDocument d; toJson(c, d.to<JsonObject>()); jsonResponse(d);
+    configResponse(c);
   });
   server.on("/api/learn/start", HTTP_POST, [] {
     if (!allowRequest(true)) { return; }

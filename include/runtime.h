@@ -60,6 +60,7 @@ class Runtime {
   bool reconnectHid();
   Config config();
   void apply(const Config& cfg);
+  void setFunctionOrder(std::string order);
   void setPasscode(const String& passcode);
   void setInputMode(bool enabled);
   void status(JsonObject out, bool includeLogs);

@@ -1,0 +1,7 @@
+{
+  "name": "steering-switch-web",
+  "private": true,
+  "devDependencies": {
+    "terser": "5.44.1"
+  }
+}

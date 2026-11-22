@@ -1,11 +1,21 @@
 #include "macro_runner.h"
 #include "keys.h"
 namespace sw {
+namespace {
+bool needsKeyboard(const Step& step) {
+  return step.type == "text" || (step.type == "chord" && (step.key || step.modifiers));
+}
+bool sendChord(const Step& step, bool pressed) {
+  if (pressed && step.globe && !sendMedia(kGlobeUsage)) return false;
+  if (needsKeyboard(step) && !sendKey(pressed ? step.key : 0, pressed ? step.modifiers : 0)) return false;
+  return pressed || !step.globe || sendMedia(0);
+}
+}
 bool MacroRunner::start(std::vector<Step> steps) {
   if (busy() || steps.empty() || !hidReady()) return false;
   for (const auto& step : steps) {
-    if ((step.type == "chord" || step.type == "text") && !hidKeyboardReady()) return false;
-    if (step.type == "media" && !hidMediaReady()) return false;
+    if (needsKeyboard(step) && !hidKeyboardReady()) return false;
+    if ((step.type == "media" || step.globe) && !hidMediaReady()) return false;
   }
   steps_ = std::move(steps); index_ = textIndex_ = 0; phase_ = 0; return true;
 }
@@ -20,7 +30,8 @@ int MacroRunner::tick(uint32_t now) {
   if (index_ >= steps_.size()) { cancel(); return 1; }
   auto& s = steps_[index_];
   if (phase_ == 1 && uint32_t(now - changedAt_) >= 30) {
-    const bool released = s.type == "media" ? sendMedia(0) : sendKey(0, 0);
+    const bool released = s.type == "media" ? sendMedia(0) :
+      s.type == "chord" ? sendChord(s, false) : sendKey(0, 0);
     if (!released) { cancel(); return -1; }
     phase_ = 2; changedAt_ = now;
   } else if (phase_ == 2 && uint32_t(now - changedAt_) >= 30) {
@@ -33,7 +44,7 @@ int MacroRunner::tick(uint32_t now) {
     if (s.type == "wait") phase_ = 3;
     else {
       bool ok = false;
-      if (s.type == "chord") ok = sendKey(s.key, s.modifiers);
+      if (s.type == "chord") ok = sendChord(s, true);
       if (s.type == "media") ok = sendMedia(s.usage);
       if (s.type == "text" && textIndex_ < s.text.size()) {
         uint8_t key = 0, mod = 0;

@@ -12,7 +12,8 @@ const statusTimeoutMs = 3000;
 const chartWindowMs = 30000;
 let renderedLogs = '';
 let saving = false;
-let wifiDirty = false, passcodeDirty = false, wifiSaving = false, passcodeSaving = false;
+let macroDraft = null, macroDeleting = false, macroGroup = 'macros';
+let wifiDirty = false, wifiSaving = false;
 let firmwareRequest = false, firmwareTarget = '';
 let testPending = false;
 const isTouchEditor = navigator.maxTouchPoints > 0;
@@ -20,12 +21,11 @@ const inputModeClient = Array.from(crypto.getRandomValues(new Uint8Array(8)),
   byte => byte.toString(16).padStart(2, '0')).join('');
 let inputModeRequested = false, inputModeRequest = null, inputModeDesired = false;
 let focusTimer, inputModeHeartbeat;
-const keyboardFields = ['wifi-ssid', 'wifi-password', 'passcode', 'button-name-input', 'ble-name-input'];
+const keyboardFields = ['wifi-ssid', 'wifi-password', 'button-name-input', 'ble-name-input'];
 const fieldKeyboard = $('field-keyboard');
 const fieldKeyboardHome = fieldKeyboard.parentElement;
 let keyboardField, keyboardTimer, keyboardLayout;
 let messageTimer;
-const builtins = [['none','未割り当て'],['volume_up','音量＋（押し続けで連続）'],['volume_down','音量－（押し続けで連続）'],['play_pause','再生／一時停止'],['mute','消音'],['next','次の曲'],['previous','前の曲'],['home','ホーム'],['switch_app','アプリ切り替え'],['maps','Googleマップ'],['youtube','YouTube'],['siri','Siri'],['lock','画面ロック'],['app_list','アプリ一覧'],['passcode','パスコード送信（長押し専用）']];
 const presetIds = ['maps','youtube','siri','lock','app_list'];
 const settingsGroups = {
   inputs: ['入力設定', ['channels'], renderInputs],
@@ -33,7 +33,7 @@ const settingsGroups = {
   ble: ['Bluetooth設定', ['ble'], renderBleFields],
   acc: ['ACC設定', ['acc'], renderAcc],
 };
-const configKeys = ['channels','buttons','macros','name','outputEnabled','timing','ble','acc'];
+const configKeys = ['channels','buttons','macros','functions','functionOrder','name','outputEnabled','timing','ble','acc'];
 const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
@@ -54,14 +54,14 @@ function setText(id, value) {
   const node = $(id);
   if (node.textContent !== value) node.textContent = value;
 }
-function hasChanges() { return dirty || wifiDirty || passcodeDirty || previewingConfig || saving || wifiSaving || passcodeSaving; }
+function hasChanges() { return dirty || hasMacroEdits() || wifiDirty || previewingConfig || saving || wifiSaving; }
 function unsavedParts() {
   const labels = Object.values(settingsGroups).filter(group => group[1].some(changed)).map(group => group[0]);
-  return [previewingConfig && '読み込んだ設定', changed('buttons') && 'ボタン割当', changed('macros') && 'マクロ',
-    ...labels, wifiDirty && 'Wi-Fi', passcodeDirty && '端末パスコード'].filter(Boolean);
+  return [previewingConfig && '読み込んだ設定', changed('buttons') && 'ボタン割当', (changed('macros') || changed('functions') || changed('functionOrder') || hasMacroEdits()) && '機能割当',
+    ...labels, wifiDirty && 'Wi-Fi'].filter(Boolean);
 }
 function changed(key) {
-  if (key === 'buttons' || key === 'macros') {
+  if (key === 'buttons' || key === 'macros' || key === 'functions') {
     return config && (config[key].length !== saved[key].length ||
       config[key].some(item => !equal(item, savedItem(key, item))));
   }
@@ -72,9 +72,10 @@ function refreshDirty() {
   for (const controls of document.querySelectorAll('.config-save')) controls.update();
   $('config-preview').hidden = !previewingConfig;
   $('save-preview').disabled = $('cancel-preview').disabled = saving;
+  $('reset-functions').disabled = saving || previewingConfig;
   $('cancel-wifi').disabled = !wifiDirty || wifiSaving;
-  $('cancel-passcode').disabled = !passcodeDirty || passcodeSaving;
   $('apply-learn').disabled = saving || applyingCapture;
+  $('save-macro').disabled = $('discard-macro').disabled = $('macro-editor-fields').disabled = saving;
 }
 function setDirty() { refreshDirty(); }
 function saveControls(label, hasEdits, apply, undo, id = '') {
@@ -194,10 +195,10 @@ async function connectWorkspace() {
 async function openWorkspace() {
   config = await api('config'); saved = clone(config); histories = [[],[]];
   chartClock = undefined; chartCursor = null; lastReadingAt = -Infinity;
-  wifiDirty = passcodeDirty = false;
-  $('wifi-password').value=''; $('passcode').value='';
-  $('show-wifi-password').checked=$('show-passcode').checked=false;
-  $('wifi-password').type=$('passcode').type='password';
+  wifiDirty = false;
+  $('wifi-password').value = '';
+  $('show-wifi-password').checked = false;
+  $('wifi-password').type = 'password';
   learningButton = null; previewingConfig = false; renderAll();
   $('message').hidden = true;
   $('opening').hidden = true; $('workspace').hidden = false;
@@ -438,20 +439,22 @@ async function applyLearning() {
 function channelHasSpace(channel, except) {
   return config.buttons.filter(button=>button !== except && button.channel===channel).length < 16;
 }
+const macroAction = id => presetIds.includes(id) ? id : 'macro:'+id;
 function actionOptions(isLong) {
-  return [...builtins.filter(([id])=>isLong || id!=='passcode'),...config.macros.map(m=>['macro:'+m.id,'マクロ：'+m.name])];
+  return [['none','未割り当て'],...config.functions.filter(m=>isLong || m.id!=='passcode').map(m=>[m.id,m.name]),
+    ...config.macros.map(m=>[macroAction(m.id),m.name])];
 }
+function actionSteps(settings, action) {
+  if (action.startsWith('macro:')) return settings.macros.find(m=>m.id===action.slice(6))?.steps;
+  return (settings.functions.find(m=>m.id===action) || settings.macros.find(m=>m.id===action))?.steps;
+}
+const confirmTestDigits = () => confirm('接続先のロックを解除して、メモの空欄を開いてください。テスト用に 0123456789 を送信します。');
 async function testAction(action) {
   if (testPending) return;
-  if (action==='test_digits' && !confirm('接続先のロックを解除して、メモの空欄を開いてください。テスト用に 0123456789 を送信します。')) return;
+  if (action==='test_digits' && !confirmTestDigits()) return;
   if ($('learn-dialog').open) throw new Error('学習画面を閉じてからテストしてください。');
-  const macroId = action.startsWith('macro:') ? action.slice(6) : action;
-  if (action.startsWith('macro:') || presetIds.includes(action)) {
-    const draft = config.macros.find(macro => macro.id === macroId);
-    const applied = saved.macros.find(macro => macro.id === macroId);
-    if (JSON.stringify(draft?.steps) !== JSON.stringify(applied?.steps)) {
-      throw new Error('マクロの変更を保存するか、マクロ画面で編集中の内容をテストしてください。');
-    }
+  if (!equal(actionSteps(config, action), actionSteps(saved, action))) {
+    throw new Error('機能の変更を保存するか、機能割当で編集中の内容をテストしてください。');
   }
   const result = await sendTest({action});
   if (result) note(result.message);
@@ -499,7 +502,8 @@ function renderButtons() {
     for (const [key,label] of [['shortAction','短押し'],['doubleAction','ダブルクリック'],['longAction','長押し']]) {
       const selected = button[key];
       const unavailable = key !== 'shortAction' && ['volume_up','volume_down'].includes(button.shortAction);
-      const action = selectField(label,actionOptions(key==='longAction'),selected,value=>{
+      const shown = selected.startsWith('macro:') && presetIds.includes(selected.slice(6)) ? selected.slice(6) : selected;
+      const action = selectField(label,actionOptions(key==='longAction'),shown,value=>{
         button[key]=value;
         if (key==='shortAction' && ['volume_up','volume_down'].includes(value)) button.doubleAction=button.longAction='none';
         setDirty(); renderButtons();
@@ -543,29 +547,46 @@ function renderButtons() {
         () => saveButton(button), () => cancelItem('buttons', button, renderButtons)));
   }));
 }
-const shortcutModifiers = [[17,'Control'],[68,'Option'],[34,'Shift'],[136,'Command']];
+const shortcutModifiers = [[1,'Control'],[4,'Option'],[2,'Shift'],[8,'Command']];
+const rightModifiers = shortcutModifiers.map(([bit,label])=>[bit << 4,'右'+label]);
+const allModifiers = [...shortcutModifiers,...rightModifiers];
+const keyRange = (first,labels) => Array.from(labels,(label,index)=>[first+index,label]);
+const functionKeys = (first,number) => [0,6].map(offset=>
+  keyRange(first+offset,Array.from({length:6},(_,i)=>'F'+(number+offset+i))));
 const shortcutRows = [
-  [...'1234567890'].map((label,i)=>[30+i,label]),
-  [...'QWERTYUIOP'].map(letter=>[letter.charCodeAt(0)-61,letter]),
-  [...'ASDFGHJKL'].map(letter=>[letter.charCodeAt(0)-61,letter]),
-  [...'ZXCVBNM'].map(letter=>[letter.charCodeAt(0)-61,letter]),
-  [[41,'Esc'],[43,'Tab'],[44,'Space'],[40,'Enter'],[42,'⌫']],
-  [[80,'←'],[82,'↑'],[81,'↓'],[79,'→'],[76,'Delete']],
-  [...'-=[]\\;\',./'].map((label,i)=>[[45,46,47,48,49,51,52,54,55,56][i],label]),
-  Array.from({length:12},(_,i)=>[58+i,'F'+(i+1)]),
+  keyRange(30,'1234567890'),
+  ...['QWERTYUIOP','ASDFGHJKL','ZXCVBNM'].map(row=>Array.from(row,key=>[key.charCodeAt(0)-61,key])),
+  [[41,'Esc'],[43,'Tab'],[57,'Caps Lock'],[44,'Space'],[40,'Enter'],[42,'⌫']],
+  keyRange(73,['Insert','Home','Pg Up','Delete','End','Pg Down']),
+  [[80,'←'],[82,'↑'],[81,'↓'],[79,'→']],
 ];
-const shortcutLabels = new Map(shortcutRows.flat());
+const extraShortcutRows = [
+  ...functionKeys(58,1), ...functionKeys(104,13),
+  keyRange(45,'-=[]\\'), keyRange(51,";'\`,./"),
+  keyRange(70,['Print Screen','Scroll Lock','Pause']),
+  [[50,'非US #/~'],[100,'非US \\/|'],[101,'Application'],[102,'Power']],
+  keyRange(83,['Num Lock',...Array.from('/*-+',key=>'テンキー '+key)]),
+  [[88,'テンキー Enter'],[99,'テンキー .'],[103,'テンキー =']],
+  ...['789','456','1230'].map(row=>Array.from(row,key=>[key==='0' ? 98 : 88+Number(key),'テンキー '+key])),
+];
+const shortcutLabels = new Map([...shortcutRows,...extraShortcutRows].flat());
 shortcutLabels.set(42,'Backspace');
 let shortcutDraft, applyShortcut, shortcutTimer, shortcutListening = false;
-function validShortcut(key) { return Number.isInteger(key) && key>=4 && key<=115; }
-function chordDisplay(step) {
+function validShortcut({key,modifiers,globe}) {
+  return key===0 ? modifiers>0 || globe : shortcutLabels.has(key);
+}
+function shortcutDisplay(step) {
   const {key, modifiers} = step;
-  if (!validShortcut(key)) return '—';
-  const parts = shortcutModifiers
+  if (!validShortcut(step)) return '—';
+  const parts = allModifiers
     .filter(([mask]) => (modifiers & mask)!==0).map(([,name]) => name);
-  return [...parts,shortcutLabels.get(key) || 'HID '+key].join('＋');
+  if (step.globe) parts.unshift('地球儀');
+  if (key) parts.push(shortcutLabels.get(key));
+  return parts.join('＋');
 }
 function showShortcutKeyboard(step, onApply) {
+  clearTimeout(shortcutTimer);
+  shortcutListening = false;
   applyShortcut = onApply;
   shortcutDraft = {...step};
   $('shortcut-feedback').textContent = '';
@@ -574,46 +595,62 @@ function showShortcutKeyboard(step, onApply) {
     const keyButton = (value,label,kind,select) => el('button',{
       type:'button',class:'secondary',['data-'+kind]:value,'aria-pressed':'false',
       ...(value===42 && kind==='key' ? {'aria-label':'Backspace'} : {}),
-      onclick:()=>{select();updateShortcutKeyboard();}
+      onclick:()=>{shortcutDraft=select();updateShortcutKeyboard();}
     },label);
-    $('shortcut-modifiers').replaceChildren(...shortcutModifiers.map(([mask,label])=>keyButton(mask,label,'modifier',()=>{
-      shortcutDraft.modifiers = shortcutDraft.modifiers & mask ? shortcutDraft.modifiers & ~mask :
-        shortcutDraft.modifiers | (mask & 15);
-    })));
-    $('shortcut-keys').replaceChildren(...shortcutRows.map(row=>el('div',{class:'shortcut-row'},
-      row.map(([key,label])=>keyButton(key,label,'key',()=>{shortcutDraft.key=key;})))));
+    const rows = keys => keys.map(row=>el('div',{class:'shortcut-row'},row.map(([key,label])=>
+      keyButton(key,label,'key',()=>({...shortcutDraft,key:shortcutDraft.key===key ? 0 : key})))));
+    const modifiers = keys => keys.map(([bit,label])=>keyButton(bit,label,'modifier',()=>
+      ({...shortcutDraft,modifiers:shortcutDraft.modifiers ^ bit})));
+    const globe = keyButton('', '🌐 地球儀', 'globe',()=>{
+      const next = {...shortcutDraft};
+      if (next.globe) delete next.globe;
+      else next.globe = true;
+      return next;
+    });
+    $('shortcut-modifiers').replaceChildren(...modifiers(shortcutModifiers),globe);
+    $('shortcut-keys').replaceChildren(...rows(shortcutRows),
+      el('details',{id:'shortcut-more'},el('summary',{},'F1〜F24・テンキー・その他'),
+        el('div',{class:'shortcut-row'},modifiers(rightModifiers)),
+        ...rows(extraShortcutRows)));
   }
+  $('shortcut-more').open = !!(shortcutDraft.modifiers & 240) ||
+    !!$('shortcut-more').querySelector('[data-key="'+shortcutDraft.key+'"]');
   updateShortcutKeyboard();
   $('shortcut-dialog').showModal();
+  $('shortcut-dialog').scrollTop = 0;
   checkInputFocus();
 }
 function updateShortcutKeyboard() {
-  setText('shortcut-selection', chordDisplay(shortcutDraft));
-  for (const key of $('shortcut-keys').querySelectorAll('button')) key.setAttribute('aria-pressed',+key.dataset.key===shortcutDraft.key);
-  for (const modifier of $('shortcut-modifiers').querySelectorAll('button')) {
+  shortcutListening = false;
+  setText('shortcut-selection', shortcutDisplay(shortcutDraft));
+  for (const key of $('shortcut-keys').querySelectorAll('[data-key]')) {
+    key.setAttribute('aria-pressed',+key.dataset.key===shortcutDraft.key);
+  }
+  $('shortcut-modifiers').querySelector('[data-globe]').setAttribute('aria-pressed',!!shortcutDraft.globe);
+  for (const modifier of $('shortcut-dialog').querySelectorAll('[data-modifier]')) {
     modifier.setAttribute('aria-pressed',!!(shortcutDraft.modifiers & +modifier.dataset.modifier));
   }
-  for (const id of ['shortcut-test','shortcut-delay','shortcut-apply']) $(id).disabled=!validShortcut(shortcutDraft.key);
+  for (const id of ['shortcut-test','shortcut-delay','shortcut-apply']) $(id).disabled=!validShortcut(shortcutDraft);
 }
 async function testShortcut(delay) {
   if (testPending) return;
   const draft = shortcutDraft;
-  const steps = [{type:'chord', key:draft.key, modifiers:draft.modifiers}];
+  const steps = [draft];
   if (delay) steps.unshift({type:'wait',ms:5000});
   const display = $('shortcut-feedback');
   clearTimeout(shortcutTimer);
-  shortcutListening = true;
+  shortcutListening = !!(draft.key || draft.modifiers);
   $('shortcut-received').textContent = '';
   display.focus();
-  display.textContent = '送信を準備しています…';
+  display.textContent = '送信準備中…';
   try {
-    const result = await sendTest({steps});
+    await sendTest({steps});
     if (shortcutDraft !== draft) return;
-    display.textContent = delay ? '5秒後に送信します。iPadで試したい画面を開いてください。' :
-      '送信を開始しました。iPadの反応を確認してください。';
-    shortcutTimer = setTimeout(()=>{
+    display.textContent = delay ? '5秒後に送信します。' : '送信を開始しました。';
+    if (shortcutListening) shortcutTimer = setTimeout(()=>{
+      if (shortcutDraft !== draft) return;
       shortcutListening=false;
-      if (!$('shortcut-received').textContent) setText('shortcut-received','このページでキーを確認できませんでした。');
+      if (!$('shortcut-received').textContent) setText('shortcut-received','このページで受信なし');
     },delay ? 7000 : 2000);
   } catch (error) {
     if (shortcutDraft === draft) {
@@ -629,75 +666,181 @@ function clearMacroReference(buttons, id) {
     return updated;
   });
 }
+const macroList = $('macro-list');
+let draggedFunction, functionDropTarget;
 function renderMacros() {
-  $('macro-cards').replaceChildren(...config.macros.map(m=>{
-    const card = el('section',{class:'macro-card','data-macro-id':m.id});
-    const heading = el('h3',{},m.name);
-    const title = el('div',{class:'card-heading'},heading);
-    if (!presetIds.includes(m.id)) title.append(el('button',{class:'quiet',onclick:()=>run(async()=>{
-      if(!confirm('このマクロを削除しますか？参照中のボタンは未割り当てになります。'))return;
-      if (!previewingConfig && savedItem('macros', m)) {
+  const rows = new Map();
+  for (const group of ['functions','macros']) for (const m of config[group]) {
+    const action = group==='macros' ? macroAction(m.id) : m.id;
+    rows.set(action,el('li',{draggable:'true','data-action':action},el('button',{
+      type:'button',class:'secondary','data-macro-id':m.id,'data-group':group,'aria-haspopup':'dialog',onclick:()=>openMacro(m, group)
+    }, m.name)));
+  }
+  const order = new Set([...config.functionOrder.split(','),...rows.keys()]);
+  macroList.replaceChildren(...[...order].map(action=>rows.get(action)).filter(Boolean));
+  $('add-macro').disabled = config.macros.length >= 16;
+}
+function markFunctionDrop(target) {
+  if (target===functionDropTarget) return;
+  functionDropTarget?.classList.remove('drop-target');
+  functionDropTarget = target;
+  target?.classList.add('drop-target');
+}
+macroList.addEventListener('dragstart',event=>{
+  const row = event.target.closest('li');
+  if (!row || saving) { event.preventDefault(); return; }
+  draggedFunction = row;
+  row.classList.add('dragging');
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain',row.dataset.action);
+});
+macroList.addEventListener('dragover',event=>{
+  if (!draggedFunction || saving) return;
+  const row = event.target.closest('li');
+  markFunctionDrop(row !== draggedFunction ? row : null);
+  if (!functionDropTarget) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+});
+macroList.addEventListener('dragleave',event=>{
+  if (!macroList.contains(event.relatedTarget)) markFunctionDrop(null);
+});
+macroList.addEventListener('dragend',()=>{
+  draggedFunction?.classList.remove('dragging');
+  draggedFunction = null;
+  markFunctionDrop(null);
+});
+macroList.addEventListener('drop',event=>{
+  const target = event.target.closest('li');
+  if (!draggedFunction || !target || target===draggedFunction || saving) return;
+  event.preventDefault();
+  const order = [...macroList.children].map(row=>row.dataset.action);
+  const from = order.indexOf(draggedFunction.dataset.action);
+  const to = order.indexOf(target.dataset.action);
+  order.splice(to,0,order.splice(from,1)[0]);
+  draggedFunction = null;
+  markFunctionDrop(null);
+  const previous = config.functionOrder;
+  config.functionOrder = order.join(',');
+  renderMacros();
+  if (previewingConfig) { refreshDirty(); return; }
+  void run(async()=>{
+    try {
+      await saveSettings(['functionOrder']);
+      note('機能の並び順を保存しました。');
+    } catch (error) {
+      config.functionOrder = previous;
+      renderMacros(); refreshDirty();
+      throw error;
+    }
+  });
+});
+function hasMacroEdits() {
+  return !!macroDraft && (macroDeleting || !equal(macroDraft, config[macroGroup].find(m=>m.id===macroDraft.id)));
+}
+function openMacro(m, group = 'macros') {
+  macroDraft = clone(m);
+  macroGroup = group;
+  macroDeleting = false;
+  $('delete-macro').hidden = group==='functions' || presetIds.includes(m.id) || !config.macros.some(item=>item.id===m.id);
+  setText('save-macro', previewingConfig ? '下書きに保存' : '保存');
+  renderMacroEditor();
+  updateMacroDeletion();
+  $('macro-dialog').showModal();
+  $('macro-scroll').scrollTop = 0;
+  $('macro-title').focus();
+}
+function macroFeedback(message = '', kind = '') {
+  feedback('macro-feedback', message, kind);
+  $('macro-feedback').hidden = !message;
+}
+function updateMacroDeletion() {
+  $('macro-fields').hidden = macroDeleting;
+  setText('delete-macro', macroDeleting ? '削除を取り消す' : 'この機能を削除');
+  macroFeedback(macroDeleting ? '保存するとこの機能が削除され、割り当てたボタンは未割り当てになります。' : '');
+}
+function closeMacro() {
+  const id = macroDraft.id;
+  macroDraft = null;
+  $('macro-dialog').close();
+  $('macro-fields').replaceChildren();
+  (document.querySelector('#macro-list [data-group="'+macroGroup+'"][data-macro-id="'+id+'"]') || $('add-macro')).focus();
+  checkInputFocus();
+}
+async function saveMacro() {
+  if (saving || !macroDraft) return;
+  const m = macroDraft;
+  if (!hasMacroEdits()) { closeMacro(); return; }
+  const item = macroDeleting ? undefined : m;
+  try {
+    if (!previewingConfig) {
+      const fields = {[macroGroup]:replaceItem(saved[macroGroup], m.id, item)};
+      if (macroDeleting) {
         const buttons = clearMacroReference(saved.buttons, m.id);
-        const fields = {macros:replaceItem(saved.macros, m.id)};
         if (!equal(buttons, saved.buttons)) fields.buttons = buttons;
-        note((await saveConfig(fields)).message);
       }
-      config.macros=replaceItem(config.macros, m.id);
-      config.buttons=clearMacroReference(config.buttons, m.id);
-      renderMacros();renderButtons();refreshDirty();
-    })},'削除'));
-    card.append(title);
-    const name = field('マクロ名',m,'name','text',{maxlength:32});
-    name.addEventListener('input',()=>{heading.textContent=m.name;});
-    card.append(name);
-    m.steps.forEach((s,index)=>{
-      const fields=el('div',{class:'fields'},selectField('操作',[['chord','キー／ショートカット'],['media','メディアキー'],['text','文字列'],['wait','待機']],s.type,value=>{
-        m.steps[index]={type:value,...(value==='chord'?{key:30,modifiers:0}:value==='media'?{usage:205}:value==='text'?{text:'sample'}:{ms:500})};setDirty();renderMacros();
-      }));
+      macroFeedback('保存中…');
+      note((await saveConfig(fields)).message);
+    }
+    config[macroGroup] = replaceItem(config[macroGroup], m.id, item);
+    if (macroDeleting) config.buttons = clearMacroReference(config.buttons, m.id);
+    renderMacros();renderButtons();refreshDirty();closeMacro();
+  } catch (error) {
+    macroFeedback(error.message, 'error');
+  }
+}
+function renderMacroEditor() {
+  const m = macroDraft;
+  const card = $('macro-fields');
+  card.replaceChildren(field('機能名',m,'name','text',{maxlength:32}));
+  const operations = [['chord','キーボード／ショートカット'],['media','メディアキー'],['text','文字列'],['wait','待機']];
+  if (macroGroup==='functions' && m.id==='passcode') operations.push(['passcode','保存済みパスコード']);
+  m.steps.forEach((s,index)=>{
+    const operation = s.type;
+    const fields=el('div',{class:'fields'},selectField('操作',operations,operation,value=>{
+      m.steps[index]={type:value,...(value==='chord'?{key:30,modifiers:0}:value==='media'?{usage:205}:value==='text'?{text:'sample'}:value==='wait'?{ms:500}:{})};renderMacroEditor();
+    }));
+    if(operation==='chord') {
+      const selection = el('span',{class:'shortcut-value'},shortcutDisplay(s));
+      fields.append(el('div',{class:'field-with-action wide'},selection,el('button',{
+        type:'button',class:'secondary open-shortcut',onclick:()=>showShortcutKeyboard(s,chosen=>{
+          m.steps[index]=chosen;
+          renderMacroEditor();
+          card.children[index+1].querySelector('.open-shortcut')?.focus();
+        })
+      },'キーボードで選ぶ')));
       if(s.type==='chord') {
-        const selection = el('span',{class:'shortcut-value'},chordDisplay(s));
-        const keyField = field('HIDキー番号（10進数）',s,'key','number',{min:4,max:115,step:1});
+        const keyField = field('HIDキー番号（10進数）',s,'key','number',{min:0,max:115,step:1});
         const modifiers = el('div',{class:'modifiers'});
-        const shortcut = el('div',{class:'field-with-action wide'},selection,el('button',{
-          type:'button',class:'secondary open-shortcut',onclick:()=>showShortcutKeyboard(s,chosen=>{
-            Object.assign(s, chosen);
-            keyField.querySelector('input').value = s.key;
-            for (const check of modifiers.querySelectorAll('input')) check.checked=!!(s.modifiers & +check.value);
-            selection.textContent=chordDisplay(s);
-            setDirty();
-          })
-        },'キーボードで選ぶ'));
-        fields.append(shortcut);
-        for(const [bit,label] of [[1,'Control'],[2,'Shift'],[4,'Option / Alt'],[8,'Command / GUI']]) {
-          const check=el('input',{type:'checkbox',value:bit,checked:!!(s.modifiers&bit),onchange:event=>{s.modifiers=event.target.checked?s.modifiers|bit:s.modifiers&~bit;setDirty();}});
+        for(const [bit,label] of allModifiers) {
+          const check=el('input',{type:'checkbox',value:bit,checked:!!(s.modifiers&bit),onchange:event=>{s.modifiers=event.target.checked?s.modifiers|bit:s.modifiers&~bit;}});
           modifiers.append(el('label',{class:'check'},check,label));
         }
         const advanced=el('details',{class:'wide'},el('summary',{},'キー番号と修飾キー'),keyField,modifiers);
-        for (const event of ['input','change']) advanced.addEventListener(event,()=>{selection.textContent=chordDisplay(s);});
+        for (const event of ['input','change']) advanced.addEventListener(event,()=>{selection.textContent=shortcutDisplay(s);});
         fields.append(advanced);
       }
-      if(s.type==='media')fields.append(selectField('メディア操作',[[233,'音量＋'],[234,'音量－'],[226,'消音'],[205,'再生／一時停止'],[181,'次の曲'],[182,'前の曲'],[183,'停止']],s.usage,value=>{s.usage=Number(value);setDirty();}));
-      if(s.type==='text') { const f=field('入力文字列（ASCII）',s,'text','text',{maxlength:128});f.classList.add('wide');fields.append(f); }
-      if(s.type==='wait')fields.append(field('待機時間 ms',s,'ms','number',{min:0,max:10000,step:1}));
-      const tools=el('div',{class:'step-toolbar'},el('button',{class:'secondary',disabled:index===0,onclick:()=>{[m.steps[index-1],m.steps[index]]=[m.steps[index],m.steps[index-1]];setDirty();renderMacros();}},'↑'),
-        el('button',{class:'secondary',disabled:index===m.steps.length-1,onclick:()=>{[m.steps[index+1],m.steps[index]]=[m.steps[index],m.steps[index+1]];setDirty();renderMacros();}},'↓'),
-        el('button',{class:'secondary',onclick:()=>{m.steps.splice(index,1);setDirty();renderMacros();}},'削除'));
-      card.append(el('div',{class:'step'},fields,tools));
-    });
-    card.append(el('div',{class:'actions'},el('button',{class:'secondary',disabled:m.steps.length>=32,onclick:()=>{m.steps.push({type:'wait',ms:500});setDirty();renderMacros();}},'ステップ追加'),
-      el('button',{class:'secondary test-macro',onclick:()=>run(async()=>{
-        const result=await sendTest({steps:m.steps});
-        if (result) note(result.message);
-      })},'マクロをテスト')),
-      saveControls('マクロ', () => !equal(m, savedItem('macros', m)),
-        () => saveConfig({macros:replaceItem(saved.macros, m.id, m)}),
-        () => {
-          if (!savedItem('macros', m)) config.buttons=clearMacroReference(config.buttons, m.id);
-          cancelItem('macros', m, renderMacros);
-          renderButtons();
-        }));
-    return card;
-  }));
+    }
+    if(operation==='media')fields.append(selectField('送信キー',[[233,'音量＋'],[234,'音量－'],[226,'消音'],[205,'再生／一時停止'],[181,'次の曲'],[182,'前の曲'],[183,'停止']],s.usage,value=>{s.usage=Number(value);}));
+    if(s.type==='text') { const f=field('入力文字列（ASCII）',s,'text','text',{maxlength:128});f.classList.add('wide');fields.append(f); }
+    if(s.type==='wait')fields.append(field('待機時間 ms',s,'ms','number',{min:0,max:10000,step:1}));
+    const tools=el('div',{class:'step-toolbar'},el('button',{class:'secondary',disabled:index===0,onclick:()=>{[m.steps[index-1],m.steps[index]]=[m.steps[index],m.steps[index-1]];renderMacroEditor();}},'↑'),
+      el('button',{class:'secondary',disabled:index===m.steps.length-1,onclick:()=>{[m.steps[index+1],m.steps[index]]=[m.steps[index],m.steps[index+1]];renderMacroEditor();}},'↓'),
+      el('button',{class:'secondary',onclick:()=>{m.steps.splice(index,1);renderMacroEditor();}},'削除'));
+    card.append(el('div',{class:'step'},fields,tools));
+  });
+  card.append(el('div',{class:'actions'},el('button',{class:'secondary',disabled:m.steps.length>=32,onclick:()=>{m.steps.push({type:'wait',ms:500});renderMacroEditor();}},'ステップ追加'),
+    el('button',{class:'secondary test-macro',onclick:async()=>{
+      try {
+        const sample = m.steps.some(step=>step.type==='passcode');
+        if (sample && !confirmTestDigits()) return;
+        const steps = sample ? m.steps.map(step=>step.type==='passcode' ? {type:'text',text:'0123456789'} : step) : m.steps;
+        const result=await sendTest({steps});
+        if (result && macroDraft===m) macroFeedback(result.message, 'good');
+      } catch (error) {
+        if (macroDraft===m) macroFeedback(error.message, 'error');
+      }
+    }},'機能をテスト')));
 }
 function renderSettings() {
   renderGeneral();
@@ -706,8 +849,7 @@ function renderSettings() {
 function renderGeneral() {
   const fields=$('general-fields');
   fields.replaceChildren(field('設定名',config,'name','text',{maxlength:32}),field('キー送信を有効にする',config,'outputEnabled','checkbox',{id:'output-enabled-input'}));
-  for(const [key,label,min,max] of [['debounceMs','安定判定 ms',5,250],['longMs','長押し ms',400,5000],['doubleMs','ダブルクリック間隔 ms',100,600],['repeatDelayMs','音量の連続開始 ms',200,3000],['repeatMs','音量の連続間隔 ms',50,1000],['wakeDelayMs','パスコード送信前の待機 ms',0,10000]])fields.append(field(label,config.timing,key,'number',{min,max,step:1}));
-  fields.append(field('パスコード前にSpaceで起床する',config.timing,'wakeSpace','checkbox'));
+  for(const [key,label,min,max] of [['debounceMs','安定判定 ms',5,250],['longMs','長押し ms',400,5000],['doubleMs','ダブルクリック間隔 ms',100,600],['repeatDelayMs','音量の連続開始 ms',200,3000],['repeatMs','音量の連続間隔 ms',50,1000]])fields.append(field(label,config.timing,key,'number',{min,max,step:1}));
 }
 function renderAcc() {
   $('acc-fields').replaceChildren(field('ACC連動を有効にする',config.acc,'enabled','checkbox'),
@@ -829,9 +971,6 @@ function wifiStatus(s) {
     $('wifi-password').placeholder=s.wifiPasswordSet?'登録済み（変更しない場合は入力不要）':'Wi-Fiパスワードを入力';
   }
   if(!wifiDirty&&!wifiSaving) feedback('wifi-feedback',configured?'保存済みの設定です。接続結果は上の表示をご確認ください。':'Wi-Fi設定を入力し、保存してください。',configured?'good':'');
-  $('passcode-state').textContent=s.passcodeSet?'パスコード：登録済み':'パスコード：未登録';
-  $('passcode').placeholder=s.passcodeSet?'登録済み（変更するときだけ入力）':'4〜12桁の数字';
-  if(!passcodeDirty&&!passcodeSaving) feedback('passcode-feedback',s.passcodeSet?'パスコードは保存済みです。':'パスコードはまだ登録されていません。',s.passcodeSet?'good':'');
 }
 function renderBle(s, statusReceived = true) {
   const ble = s?.ble;
@@ -936,19 +1075,6 @@ async function saveWifi() {
   }catch(error){feedback('wifi-feedback','保存を確認できませんでした：'+error.message,'error');throw error;}
   finally{wifiSaving=false;$('save-wifi').disabled=false;refreshDirty();}
 }
-async function savePasscode() {
-  if(passcodeSaving)throw new Error('パスコードを保存中です。');
-  const passcode=$('passcode').value;
-  if(!/^[0-9]{4,12}$/.test(passcode))throw new Error('パスコードは4〜12桁の半角数字を入力してください。');
-  passcodeSaving=true;$('save-passcode').disabled=true;refreshDirty();feedback('passcode-feedback','保存しています…');
-  try{
-    const result=await api('passcode','PUT',{passcode});
-    passcodeDirty=$('passcode').value!==passcode;refreshDirty();
-    feedback('passcode-feedback',passcodeDirty?'送信したパスコードは保存済みです。その後の入力は未保存です。':'パスコードを保存しました。入力した内容はこのページに残しています。','good');
-    return result;
-  }catch(error){feedback('passcode-feedback','保存を確認できませんでした：'+error.message,'error');throw error;}
-  finally{passcodeSaving=false;$('save-passcode').disabled=false;refreshDirty();}
-}
 function renderInputMode() {
   const help = $('input-mode-help');
   let message = '';
@@ -1009,7 +1135,7 @@ function updateFieldKeyboard(field) {
     fieldKeyboardHome.append(fieldKeyboard);
     return;
   }
-  keyboardLayout = field.id === 'passcode' ? 'number' : 'lower';
+  keyboardLayout = 'lower';
   field.closest('label').after(fieldKeyboard);
   renderFieldKeyboard();
   // Safari can report the software keyboard's viewport change after an animation.
@@ -1033,7 +1159,6 @@ function showFieldKeyboard() {
 }
 function renderFieldKeyboard() {
   const rows = {
-    number: ['123', '456', '789', '0'],
     lower: ['1234567890', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm'],
     upper: ['1234567890', 'QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM'],
     symbols: ["!@#$%^&*()", "-_=+[]{}", "|\\;:'\"<>`", ",.?/~"]
@@ -1043,14 +1168,12 @@ function renderFieldKeyboard() {
   }, label);
   const panel = fieldKeyboard;
   const tools = el('div', {class:'field-keyboard-row'});
-  if (keyboardLayout !== 'number') {
-    const changeLayout = (layout, label) => key(label, () => {
-      keyboardLayout = layout;
-      renderFieldKeyboard();
-    }, true);
-    tools.append(changeLayout('lower', 'abc'), changeLayout('upper', 'ABC'),
-      changeLayout('symbols', '記号'), key('空白', () => typeFieldKey(' '), true));
-  }
+  const changeLayout = (layout, label) => key(label, () => {
+    keyboardLayout = layout;
+    renderFieldKeyboard();
+  }, true);
+  tools.append(changeLayout('lower', 'abc'), changeLayout('upper', 'ABC'),
+    changeLayout('symbols', '記号'), key('空白', () => typeFieldKey(' '), true));
   tools.append(key('削除', () => typeFieldKey(''), true), key('完了', () => {
     keyboardField?.blur();
     if (panel.contains(document.activeElement)) document.activeElement.blur();
@@ -1185,24 +1308,34 @@ window.addEventListener('pagehide', () => {
 });
 window.addEventListener('pageshow', () => {checkInputFocus();poll();});
 $('close-learn').addEventListener('click',()=> $('learn-dialog').close());
+$('macro-dialog').addEventListener('cancel',event=>event.preventDefault());
+$('discard-macro').addEventListener('click',()=>{if (!saving && macroDraft) closeMacro();});
+$('save-macro').addEventListener('click',saveMacro);
+$('delete-macro').addEventListener('click',()=>{
+  macroDeleting = !macroDeleting;
+  updateMacroDeletion();
+});
 $('shortcut-cancel').addEventListener('click',()=>$('shortcut-dialog').close());
 $('shortcut-apply').addEventListener('click',()=>{
-  applyShortcut(shortcutDraft);
   $('shortcut-dialog').close();
+  applyShortcut(shortcutDraft);
 });
 $('shortcut-test').addEventListener('click',()=>testShortcut(false));
 $('shortcut-delay').addEventListener('click',()=>testShortcut(true));
 $('shortcut-dialog').addEventListener('close',()=>{
+  if ($('shortcut-dialog').open) return;
   clearTimeout(shortcutTimer);
   shortcutDraft = applyShortcut = undefined;
   shortcutListening = false;
   checkInputFocus();
 });
 $('shortcut-feedback').addEventListener('keydown',event=>{
-  if (!shortcutListening || ['Control','Alt','Shift','Meta','Unidentified'].includes(event.key)) return;
+  if (!shortcutListening || event.key==='Unidentified') return;
+  const isModifier = ['Control','Alt','Shift','Meta'].includes(event.key);
+  if (isModifier && shortcutDraft.key!==0) return;
   const modifiers = [event.ctrlKey,event.altKey,event.shiftKey,event.metaKey];
   const keys = shortcutModifiers.filter((_,index)=>modifiers[index]).map(([,label])=>label);
-  keys.push(event.key===' ' ? 'Space' : event.key.length===1 ? event.key.toUpperCase() : event.key);
+  if (!isModifier) keys.push(event.key===' ' ? 'Space' : event.key.length===1 ? event.key.toUpperCase() : event.key);
   setText('shortcut-received','このページで受信: '+keys.join('＋'));
 });
 $('apply-learn').addEventListener('click',applyLearning);
@@ -1254,22 +1387,17 @@ $('button-name-form').addEventListener('submit',event=>{
   setDirty(); renderButtons();
   document.querySelector('[data-button-id="'+button.id+'"] .learn-button').focus();
 });
-$('add-macro').addEventListener('click',()=>{if(config.macros.length>=16){note('マクロは16個まで登録できます。',true);return;}config.macros.push({id:'m'+Date.now().toString(36),name:'新しいマクロ',steps:[{type:'wait',ms:500}]});setDirty();renderMacros();renderButtons();});
+$('add-macro').addEventListener('click',()=>openMacro({
+  id:'m'+Date.now().toString(36),name:'新しい機能',steps:[{type:'wait',ms:500}],
+}));
 function touchWifi(){wifiDirty=true;refreshDirty();feedback('wifi-feedback','入力中：まだ保存していません。');}
 for(const id of ['wifi-ssid','wifi-password','wifi-open-network'])for(const event of ['input','change'])$(id).addEventListener(event,touchWifi);
-for(const event of ['input','change'])$('passcode').addEventListener(event,()=>{passcodeDirty=!!$('passcode').value;refreshDirty();feedback('passcode-feedback',passcodeDirty?'入力中：まだ保存していません。':'空欄では保存済みパスコードを変更しません。');});
 $('show-wifi-password').addEventListener('change',()=>{$('wifi-password').type=$('show-wifi-password').checked?'text':'password';});
-$('show-passcode').addEventListener('change',()=>{$('passcode').type=$('show-passcode').checked?'text':'password';});
 $('wifi-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{note((await saveWifi()).message);await poll();});});
-$('passcode-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{note((await savePasscode()).message);await poll();});});
 $('cancel-wifi').addEventListener('click',()=>{
   wifiDirty=false;$('wifi-ssid').value=saved.ssid;$('wifi-password').value='';
   $('wifi-open-network').checked=!!saved.ssid && currentStatus?.wifiPasswordSet === false;
   feedback('wifi-feedback','入力した変更を取り消しました。');refreshDirty();
-});
-$('cancel-passcode').addEventListener('click',()=>{
-  passcodeDirty=false;$('passcode').value='';
-  feedback('passcode-feedback','入力した変更を取り消しました。');refreshDirty();
 });
 $('wifi-reconnect').addEventListener('click',()=>run(async()=>{note((await api('wifi/reconnect','POST')).message);await poll();}));
 $('firmware-check').addEventListener('click',()=>requestFirmwareUpdate());
@@ -1279,10 +1407,6 @@ $('copy-lan-url').addEventListener('click',()=>run(async()=>{
   if(navigator.clipboard?.writeText){try{await navigator.clipboard.writeText(text);note('PC用URLをコピーしました。');return;}catch{}}
   const range=document.createRange();range.selectNodeContents($('wifi-lan-url'));const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
   note('URLを選択しました。長押しまたはCtrl+Cでコピーしてください。');
-}));
-$('delete-passcode').addEventListener('click',()=>run(async()=>{
-  if(!confirm('保存済みパスコードを削除しますか？'))return;
-  const result=await api('passcode','PUT',{passcode:''});$('passcode').value='';passcodeDirty=false;refreshDirty();note(result.message);await poll();
 }));
 $('backup').addEventListener('click',()=>run(async()=>{const data=await api('backup');const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const link=el('a',{href:url,download:'steering-config-'+new Date().toISOString().slice(0,10)+'.json'});document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);note('保存済み設定をダウンロードしました。秘密情報は含まれません。');}));
 function previewConfig(data, message) {
@@ -1301,6 +1425,18 @@ $('load-defaults').addEventListener('click',()=>run(async()=>{
   if(saving)throw new Error('設定の保存が終わってから読み込んでください。');
   if(!confirm('編集内容を参考プリセットに置き換えますか？'))return;
   previewConfig(await api('defaults'), '参考プリセットを読み込みました。実車の値で校正してください。');
+}));
+$('reset-functions').addEventListener('click',()=>run(async()=>{
+  if (saving || previewingConfig || !confirm('標準機能の名前と手順を初期値に戻しますか？')) return;
+  saving=true;refreshDirty();
+  try {
+    const result = await api('functions/defaults','POST');
+    for (const key of ['functions','macros']) {
+      config[key] = result[key]; saved[key] = clone(result[key]);
+    }
+    renderMacros();renderButtons();poll();
+    note('機能のプリセットを初期値に戻しました。');
+  } finally { saving=false;refreshDirty(); }
 }));
 $('save-preview').addEventListener('click',()=>run(async()=>{
   note((await saveSettings(configKeys, true)).message);

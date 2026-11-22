@@ -23,7 +23,7 @@ bool loadConfig(Config& cfg) {
   p.end(); if (!ok) cfg = defaults(); return ok;
 }
 bool saveConfig(const Config& cfg, String& error) {
-  JsonDocument doc; toJson(cfg, doc.to<JsonObject>());
+  JsonDocument doc; toJson(cfg, doc.to<JsonObject>(), false);
   if (doc.overflowed() || measureJson(doc) > 24576) { error = "設定が大きすぎます（上限24KB）"; return false; }
   String data; serializeJson(doc, data);
   Preferences p;

@@ -48,14 +48,14 @@ namespace sw {
 bool hidReady() { return hidKeyboardReady() || hidMediaReady(); }
 bool hidKeyboardReady() { return transportReady && keyboardSubscribed; }
 bool hidMediaReady() { return transportReady && mediaSubscribed; }
-bool sendKey(uint8_t key,uint8_t modifiers) { reports.push_back(key ? "key:"+std::to_string(key)+":"+std::to_string(modifiers) : "key-release"); return hidKeyboardReady()&&transportSuccess; }
+bool sendKey(uint8_t key,uint8_t modifiers) { reports.push_back(key || modifiers ? "key:"+std::to_string(key)+":"+std::to_string(modifiers) : "key-release"); return hidKeyboardReady()&&transportSuccess; }
 bool sendMedia(uint16_t usage) { reports.push_back(usage ? "media:"+std::to_string(usage) : "media-release"); return hidMediaReady()&&transportSuccess; }
 void releaseHid() { reports.push_back("release"); }
 }
 int main(int argc,char** argv) {
   if(argc>1&&std::string(argv[1])=="--fixture") { JsonDocument doc;toJson(defaults(),doc.to<JsonObject>());std::string json;serializeJson(doc,json);std::cout<<json;return 0; }
   const std::string argument = argc>1 ? argv[1] : "";
-  if(argument=="--validate" || argument=="--patch" || argument=="--macro-test") {
+  if(argument=="--validate" || argument=="--patch" || argument=="--macro-test" || argument=="--reset-functions") {
     std::string data((std::istreambuf_iterator<char>(std::cin)),std::istreambuf_iterator<char>());
     JsonDocument d; Config c; std::string error;
     bool ok=!deserializeJson(d,data);
@@ -71,6 +71,7 @@ int main(int argc,char** argv) {
         patchConfig(d["changes"].as<JsonObjectConst>(),current,c,error);
     } else if (ok) {
       ok=fromJson(d.as<JsonVariantConst>(),c,error);
+      if (ok && argument=="--reset-functions") resetFunctionPresets(c);
     }
     JsonDocument out;
     if(ok&&argument!="--macro-test")toJson(c,out.to<JsonObject>());
@@ -200,6 +201,47 @@ int main(int argc,char** argv) {
   });
   test("reference preset is valid and output is disabled",[]{auto c=defaults();require(validate(c).empty(),"invalid defaults");require(!c.outputEnabled,"unexpected output");require(c.buttons.size()==9,"button count");});
   test("JSON round trip preserves configuration",[]{auto c=defaults();c.name="別の車";c.channels[0].pullup=470;JsonDocument d;toJson(c,d.to<JsonObject>());Config out;std::string err;require(fromJson(d.as<JsonVariantConst>(),out,err),err.c_str());require(out.name==c.name&&out.channels[0].pullup==470,"lost fields");});
+  test("legacy assignments expand editable built-in functions without changing the custom IDs", [] {
+    auto c = defaults();
+    Step key; key.type = "chord"; key.key = 30;
+    c.macros.push_back({"home", "Custom home", {key}});
+    c.buttons[6].doubleAction = "macro:home";
+    JsonDocument legacy;
+    toJson(c, legacy.to<JsonObject>(), false);
+    require(legacy["functions"].isUnbound(), "unmodified presets take up backup space");
+    Config migrated;
+    std::string error;
+    require(fromJson(legacy.as<JsonVariantConst>(), migrated, error), error.c_str());
+    require(migrated.functions.size() == 11 && migrated.buttons[6].doubleAction == "macro:home", "legacy settings changed");
+    require(findAction(migrated, "home")->steps[0].modifiers == 8 &&
+            findAction(migrated, "macro:home")->steps[0].modifiers == 0, "custom and built-in IDs collide");
+    auto& volume = migrated.functions.front();
+    volume.name = "Custom volume";
+    volume.steps = {key};
+    JsonDocument backup;
+    toJson(migrated, backup.to<JsonObject>(), false);
+    require(backup["functions"].size() == 1, "backup does not contain only the edited preset");
+    Config restored;
+    require(fromJson(backup.as<JsonVariantConst>(), restored, error), error.c_str());
+    require(findAction(restored, "volume_up")->steps[0].key == 30 &&
+            findAction(restored, "volume_down")->steps[0].usage == 234, "override or standard step lost");
+  });
+  test("resetting function presets preserves user macros and button calibration", [] {
+    auto c = defaults();
+    c.ssid = "saved-network";
+    c.outputEnabled = true;
+    c.buttons[4].center += 2;
+    c.functions.front().steps[0].usage = 226;
+    c.macros.front().name = "Edited maps";
+    c.macros.push_back({"home", "Custom home", c.macros[1].steps});
+    resetFunctionPresets(c);
+    require(findAction(c, "volume_up")->steps[0].usage == 233 &&
+            findAction(c, "maps")->name == defaults().macros.front().name, "edited presets were not reset");
+    require(findAction(c, "macro:home")->name == "Custom home" &&
+            c.buttons[4].center == defaults().buttons[4].center + 2 &&
+            c.buttons[4].shortAction == "volume_up" && c.outputEnabled && c.ssid == "saved-network", "other settings changed");
+    require(validateMacroSteps(findAction(c, "passcode")->steps) != nullptr, "saved passcode step can be sent as a raw test");
+  });
   test("Bluetooth settings preserve defaults for old backups and validate stored names",[]{
     auto c=defaults();
     JsonDocument d;
@@ -252,6 +294,18 @@ int main(int argc,char** argv) {
   test("passcode cannot bind to short or double tap",[]{auto c=defaults();c.buttons[0].shortAction="passcode";require(!validate(c).empty(),"short accepted");c.buttons[0].shortAction="none";c.buttons[0].doubleAction="passcode";require(!validate(c).empty(),"double accepted");});
   test("volume buttons cannot ambiguously bind double or long actions",[]{auto c=defaults();c.buttons[4].longAction="maps";require(!validate(c).empty(),"ambiguous volume");});
   test("macros reject unsupported text, keys, references and excessive duration",[]{auto c=defaults();Step s;s.type="text";s.text="日本語";c.macros[0].steps={s};require(!validate(c).empty(),"unicode accepted");s.type="chord";s.key=255;c.macros[0].steps={s};require(!validate(c).empty(),"key accepted");s.type="wait";s.ms=10000;c.macros[0].steps={s,s,s,s};require(!validate(c).empty(),"long macro accepted");c=defaults();c.buttons[0].shortAction="macro:missing";require(!validate(c).empty(),"bad reference");});
+  test("modifier-only steps validate and release the modifier report",[]{
+    Step step; step.type="chord"; step.modifiers=128;
+    require(!validateMacroSteps({step}), "right Command without a key rejected");
+    Step empty; empty.type="chord";
+    require(validateMacroSteps({empty}), "an empty key report accepted as a step");
+    transportReady=transportSuccess=keyboardSubscribed=true;
+    reports.clear();
+    MacroRunner runner;
+    require(runner.start({step}), "modifier step could not start");
+    for (uint32_t now=0; now<100; now+=5) runner.tick(now);
+    require(reports==std::vector<std::string>{"key:0:128","key-release","release"}, "wrong modifier report");
+  });
   test("ohm formula and changing circuit constants",[]{require(std::abs(resistance(1650,3300,330)-330)<.01,"divider");require(std::abs(resistance(1650,3300,470)-470)<.01,"pullup");require(std::isnan(resistance(3300,3300,330)),"zero divisor");require(std::isnan(resistance(3100,3300,330,true)),"saturation");});
   test("voltage classification uses millivolts with the saved hysteresis",[]{
     auto c=defaults(); const auto& b=c.buttons[0]; const auto& ch=c.channels[0];
@@ -298,6 +352,40 @@ int main(int argc,char** argv) {
     for (uint32_t now = 0; now < 100; now += 5) runner.tick(now);
     require(reports == std::vector<std::string>{"media:233", "media-release", "release"}, "wrong media release");
     keyboardSubscribed = true;
+  });
+  test("legacy Siri and Globe settings load as chords and hold Globe through the keyboard report", [] {
+    auto config = defaults();
+    const auto& siri = findAction(config, "siri_key")->steps[0];
+    const auto& globe = findAction(config, "globe")->steps[0];
+    require(siri.type == "chord" && siri.globe && siri.key == 22 &&
+      globe.type == "chord" && globe.globe && globe.key == 0, "wrong defaults");
+    require(findAction(config, "siri")->steps[0].type == "chord" && isAction(config, "siri"), "customizable Siri shortcut changed");
+    config.buttons[0].shortAction = "siri_key";
+    config.buttons[0].longAction = "globe";
+    require(validate(config).empty(), "system key assignments rejected");
+    JsonDocument doc;
+    require(!deserializeJson(doc, R"([{"type":"media","usage":207},{"type":"media","usage":669}])"), "invalid test JSON");
+    std::vector<Step> steps;
+    require(readMacroSteps(doc.as<JsonArrayConst>(), steps) && !validateMacroSteps(steps), "system key steps rejected");
+    require(steps[0].globe && steps[0].key == 22 && steps[1].globe && steps[1].key == 0,
+      "legacy steps were not converted");
+    MacroRunner runner;
+    reports.clear();
+    keyboardSubscribed = false;
+    require(!runner.start({siri}) && runner.start({globe}), "Globe-only and combined readiness were not distinguished");
+    runner.cancel();
+    keyboardSubscribed = true;
+    mediaSubscribed = false;
+    require(!runner.start({siri}), "chord started without the Globe report");
+    mediaSubscribed = true;
+    reports.clear();
+    require(runner.start(std::move(steps)), "system key steps failed to start");
+    runner.tick(0);
+    runner.tick(25);
+    require(reports == std::vector<std::string>{"media:669", "key:22:0"}, "Globe was not held with S");
+    for (uint32_t now = 30; now < 160; now += 5) runner.tick(now);
+    require(reports == std::vector<std::string>{"media:669", "key:22:0", "key-release", "media-release",
+      "media:669", "media-release", "release"}, "wrong press or release order");
   });
   test("disconnect cancels macro and cannot replay on reconnect",[]{transportReady=transportSuccess=true;reports.clear();MacroRunner r;Step s;s.type="text";s.text="1234";r.start({s});r.tick(0);transportReady=false;require(r.tick(5)==-1&&!r.busy(),"not cancelled");size_t n=reports.size();transportReady=true;r.tick(500);require(reports.size()==n,"replayed");});
   test("failed notification aborts macro instead of retrying text",[]{transportReady=true;transportSuccess=false;reports.clear();MacroRunner r;Step s;s.type="text";s.text="1234";r.start({s});require(r.tick(0)==-1&&!r.busy(),"not aborted");transportSuccess=true;r.tick(1000);require(reports.size()==2,"retried");});

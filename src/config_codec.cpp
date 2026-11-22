@@ -1,8 +1,49 @@
 #include "config_codec.h"
 #include <cstring>
 namespace sw {
+namespace {
+Step defaultStep(const FunctionPreset& preset) {
+  Step step;
+  if (preset.usage) { step.type = "media"; step.usage = preset.usage; }
+  else if (preset.key || preset.globe) {
+    step.type = "chord"; step.key = preset.key; step.modifiers = preset.globe ? 0 : 8;
+    step.globe = preset.globe;
+  }
+  else step.type = "passcode";
+  return step;
+}
+void addMissingFunctions(Config& config) {
+  for (const auto& preset : kFunctionPresets) {
+    if (!findMacro(config.functions, preset.id))
+      config.functions.push_back({preset.id, preset.name, {defaultStep(preset)}});
+  }
+}
+bool isDefaultFunction(const Macro& function, const FunctionPreset& preset) {
+  if (function.name != preset.name || function.steps.size() != 1) return false;
+  const auto& step = function.steps.front();
+  if (preset.usage) return step.type == "media" && step.usage == preset.usage;
+  if (preset.key || preset.globe)
+    return step.type == "chord" && step.key == preset.key && step.modifiers == (preset.globe ? 0 : 8) && step.globe == preset.globe;
+  return step.type == "passcode";
+}
+void writeMacro(const Macro& macro, JsonArray array) {
+  auto item = array.add<JsonObject>(); item["id"] = macro.id; item["name"] = macro.name;
+  auto steps = item["steps"].to<JsonArray>();
+  for (const auto& step : macro.steps) {
+    auto value = steps.add<JsonObject>(); value["type"] = step.type;
+    if (step.type == "wait") value["ms"] = step.ms;
+    if (step.type == "text") value["text"] = step.text;
+    if (step.type == "chord") {
+      value["key"] = step.key; value["modifiers"] = step.modifiers;
+      if (step.globe) value["globe"] = true;
+    }
+    if (step.type == "media") value["usage"] = step.usage;
+  }
+}
+}
 Config defaults() {
   Config c;
+  addMissingFunctions(c);
   const auto voltage = [](double ohms) { return std::round(3300 * ohms / (ohms + 330)); };
   for (int i = 0; i < kChannels; ++i) {
     auto& channel = c.channels[i];
@@ -35,7 +76,14 @@ Config defaults() {
   }
   return c;
 }
-void toJson(const Config& c, JsonObject o) {
+void resetFunctionPresets(Config& config) {
+  auto initial = defaults();
+  config.functions = std::move(initial.functions);
+  for (auto& macro : config.macros) {
+    if (const auto* preset = findMacro(initial.macros, macro.id)) macro = *preset;
+  }
+}
+void toJson(const Config& c, JsonObject o, bool includeDefaults) {
   o["version"] = c.version; o["name"] = c.name; o["ssid"] = c.ssid; o["outputEnabled"] = c.outputEnabled;
   auto ble = o["ble"].to<JsonObject>();
   ble["name"] = c.ble.name;
@@ -53,17 +101,15 @@ void toJson(const Config& c, JsonObject o) {
     a["shortAction"] = b.shortAction; a["doubleAction"] = b.doubleAction; a["longAction"] = b.longAction;
   }
   auto macros = o["macros"].to<JsonArray>();
-  for (const auto& m : c.macros) {
-    auto a = macros.add<JsonObject>(); a["id"] = m.id; a["name"] = m.name;
-    auto steps = a["steps"].to<JsonArray>();
-    for (const auto& s : m.steps) {
-      auto v = steps.add<JsonObject>(); v["type"] = s.type;
-      if (s.type == "wait") v["ms"] = s.ms;
-      if (s.type == "text") v["text"] = s.text;
-      if (s.type == "chord") { v["key"] = s.key; v["modifiers"] = s.modifiers; }
-      if (s.type == "media") v["usage"] = s.usage;
-    }
+  for (const auto& m : c.macros) writeMacro(m, macros);
+  JsonArray functions;
+  for (const auto& preset : kFunctionPresets) {
+    const auto* function = findMacro(c.functions, preset.id);
+    if (!function || (!includeDefaults && isDefaultFunction(*function, preset))) continue;
+    if (functions.isNull()) functions = o["functions"].to<JsonArray>();
+    writeMacro(*function, functions);
   }
+  if (includeDefaults || !c.functionOrder.empty()) o["functionOrder"] = c.functionOrder;
   auto t = o["timing"].to<JsonObject>();
   t["debounceMs"] = c.debounceMs; t["longMs"] = c.longMs; t["doubleMs"] = c.doubleMs;
   t["repeatDelayMs"] = c.repeatDelayMs; t["repeatMs"] = c.repeatMs; t["wakeDelayMs"] = c.wakeDelayMs;
@@ -102,9 +148,29 @@ bool readMacroSteps(JsonArrayConst in, std::vector<Step>& steps) {
     if (!str(v["type"], s.type, 8)) return false;
     if (s.type == "wait" && !duration(v["ms"], s.ms)) return false;
     if (s.type == "text" && !str(v["text"], s.text, 128)) return false;
-    if (s.type == "chord" && (!integer(v["key"], s.key) || !integer(v["modifiers"], s.modifiers))) return false;
-    if (s.type == "media" && !integer(v["usage"], s.usage)) return false;
+    if (s.type == "chord") {
+      if (!integer(v["key"], s.key) || !integer(v["modifiers"], s.modifiers) ||
+          (!v["globe"].isUnbound() && !boolean(v["globe"], s.globe))) return false;
+    }
+    if (s.type == "media") {
+      if (!integer(v["usage"], s.usage)) return false;
+      // Older settings exposed these operations as standalone Consumer keys.
+      if (s.usage == kGlobeUsage || s.usage == 0xCF) {
+        s.type = "chord"; s.globe = true;
+        s.key = s.usage == 0xCF ? kKeyS : 0;
+      }
+    }
     steps.push_back(std::move(s));
+  }
+  return true;
+}
+static bool readMacros(JsonArrayConst in, std::vector<Macro>& macros, size_t limit) {
+  if (in.isNull() || in.size() > limit) return false;
+  for (auto value : in) {
+    Macro macro;
+    if (!str(value["id"], macro.id, 24) || !str(value["name"], macro.name, 96) ||
+        !readMacroSteps(value["steps"].as<JsonArrayConst>(), macro.steps)) return false;
+    macros.push_back(std::move(macro));
   }
   return true;
 }
@@ -127,7 +193,7 @@ bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
         !number(a["idleTolerance"], ch.idleTolerance) || !number(a["hysteresis"], ch.hysteresis)) return fail();
   }
   if (!in["buttons"].is<JsonArrayConst>() || in["buttons"].size() > kMaxButtons ||
-      !in["macros"].is<JsonArrayConst>() || in["macros"].size() > 16) return fail();
+      !readMacros(in["macros"].as<JsonArrayConst>(), c.macros, 16)) return fail();
   for (auto a : in["buttons"].as<JsonArrayConst>()) {
     Button b;
     if (!str(a["id"], b.id, 24) || !str(a["name"], b.name, 96) || !integer(a["channel"], b.channel) ||
@@ -135,12 +201,9 @@ bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
         !str(a["shortAction"], b.shortAction, 32) || !str(a["doubleAction"], b.doubleAction, 32) || !str(a["longAction"], b.longAction, 32)) return fail();
     c.buttons.push_back(b);
   }
-  for (auto a : in["macros"].as<JsonArrayConst>()) {
-    Macro m;
-    if (!str(a["id"], m.id, 24) || !str(a["name"], m.name, 96) ||
-        !readMacroSteps(a["steps"].as<JsonArrayConst>(), m.steps)) return fail();
-    c.macros.push_back(m);
-  }
+  const auto functions = in["functions"];
+  if (!functions.isUnbound() && !readMacros(functions.as<JsonArrayConst>(), c.functions, std::size(kFunctionPresets))) return fail();
+  addMissingFunctions(c);
   auto t = in["timing"];
   if (!duration(t["debounceMs"], c.debounceMs) || !duration(t["longMs"], c.longMs) || !duration(t["doubleMs"], c.doubleMs) ||
       !duration(t["repeatDelayMs"], c.repeatDelayMs) || !duration(t["repeatMs"], c.repeatMs) ||
@@ -149,6 +212,8 @@ bool fromJson(JsonVariantConst in, Config& result, std::string& error) {
   if (!boolean(acc["enabled"], c.accEnabled) || !integer(acc["thresholdMv"], c.accThresholdMv) || !duration(acc["debounceMs"], c.accDebounceMs)) return fail();
   auto msg = validate(c);
   if (!msg.empty()) { error = msg.c_str(); return false; }
+  const auto order = in["functionOrder"];
+  if (!order.isUnbound() && !str(order, c.functionOrder, 31 * (std::size(kFunctionPresets) + 16))) return fail();
   // Named actions must always have a valid, editable macro behind them.
   for (const char* id : {"maps", "youtube", "siri", "lock", "app_list"}) {
     bool found = false; for (const auto& m : c.macros) if (m.id == id) found = true;

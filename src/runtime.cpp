@@ -97,6 +97,10 @@ void Runtime::apply(const Config& cfg) {
   Guard lock(mutex_); runner_.cancel(); cfg_ = cfg; learning_ = Learning(); resetEngines();
   logLocked("設定を適用しました。未押下状態から再開します");
 }
+void Runtime::setFunctionOrder(std::string order) {
+  Guard lock(mutex_);
+  cfg_.functionOrder = std::move(order);
+}
 void Runtime::setPasscode(const String& passcode) {
   Guard lock(mutex_); runner_.cancel(); passcode_ = passcode; resetEngines();
   logLocked(passcode.isEmpty() ? "パスコードを削除しました" : "パスコードを更新しました（内容は非表示）");
@@ -127,29 +131,19 @@ bool Runtime::actionLocked(const std::string& action, Gesture gesture, bool phys
   if (action == "none") return true;
   if (!canSendLocked(error)) return false;
   std::vector<Step> steps;
-  if (action == "passcode") {
-    if (!physical || gesture != Gesture::Long) { error = "パスコードは実ボタンの長押し専用です"; return false; }
-    if (passcode_.isEmpty()) { error = "パスコードが未登録です"; return false; }
-    if (!passcodeGate_.allow(millis(), gesture)) { error = "パスコードの再送間隔は10秒以上必要です"; return false; }
-    if (cfg_.wakeSpace) steps.push_back(chord(44, 0));
-    Step wait; wait.type = "wait"; wait.ms = cfg_.wakeDelayMs; steps.push_back(wait);
-    Step text; text.type = "text"; text.text = passcode_.c_str(); steps.push_back(text);
-  } else if (action == "test_digits") {
+  if (action == "passcode" && (!physical || gesture != Gesture::Long)) {
+    error = "パスコードは実ボタンの長押し専用です"; return false;
+  }
+  if (action == "test_digits") {
     Step text; text.type = "text"; text.text = "0123456789"; steps.push_back(text);
-  } else if (action == "home") steps.push_back(chord(11, 8));
-  else if (action == "switch_app") steps.push_back(chord(43, 8));
-  else {
-    int usage = 0;
-    if (action == "volume_up") usage = 0xE9;
-    if (action == "volume_down") usage = 0xEA;
-    if (action == "play_pause") usage = 0xCD;
-    if (action == "mute") usage = 0xE2;
-    if (action == "next") usage = 0xB5;
-    if (action == "previous") usage = 0xB6;
-    if (usage) { Step s; s.type = "media"; s.usage = usage; steps.push_back(s); }
-    else {
-      const auto id = action.rfind("macro:", 0) == 0 ? action.substr(6) : action;
-      for (const auto& m : cfg_.macros) if (m.id == id) { steps = m.steps; break; }
+  } else if (const auto* function = findAction(cfg_, action)) {
+    for (const auto& step : function->steps) {
+      if (step.type != "passcode") { steps.push_back(step); continue; }
+      if (passcode_.isEmpty()) { error = "パスコードが未登録です"; return false; }
+      if (!passcodeGate_.allow(millis(), gesture)) { error = "パスコードの再送間隔は10秒以上必要です"; return false; }
+      if (cfg_.wakeSpace) steps.push_back(chord(44, 0));
+      Step wait; wait.type = "wait"; wait.ms = cfg_.wakeDelayMs; steps.push_back(wait);
+      Step text; text.type = "text"; text.text = passcode_.c_str(); steps.push_back(std::move(text));
     }
   }
   if (steps.empty()) { error = "操作の参照先がありません"; return false; }

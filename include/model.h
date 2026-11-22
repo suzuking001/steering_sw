@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sw {
@@ -29,6 +30,7 @@ struct Step {
   std::string type = "wait", text;
   int key = 0, modifiers = 0, usage = 0;
   uint32_t ms = 100;
+  bool globe = false;
 };
 struct Macro { std::string id, name; std::vector<Step> steps; };
 struct Config {
@@ -38,7 +40,8 @@ struct Config {
   BleSettings ble;
   Channel channels[kChannels];
   std::vector<Button> buttons;
-  std::vector<Macro> macros;
+  std::vector<Macro> macros, functions;
+  std::string functionOrder;
   uint32_t debounceMs = 30, longMs = 800, doubleMs = 300;
   uint32_t repeatDelayMs = 450, repeatMs = 100, wakeDelayMs = 700;
   bool wakeSpace = true, accEnabled = false;
@@ -78,12 +81,41 @@ inline int classify(const Config& cfg, int ch, double value, int previous = kUnk
   return kUnknown;
 }
 inline bool isVolume(const std::string& a) { return a == "volume_up" || a == "volume_down"; }
-inline bool isAction(const Config& cfg, const std::string& a) {
-  const char* known[] = {"none", "volume_up", "volume_down", "play_pause", "mute", "next", "previous",
-    "home", "switch_app", "maps", "youtube", "siri", "lock", "app_list", "passcode"};
-  for (auto s : known) if (a == s) return true;
-  for (const auto& m : cfg.macros) if (a == "macro:" + m.id) return true;
+inline constexpr uint16_t kGlobeUsage = 0x29D;
+inline constexpr uint8_t kKeyS = 22;
+struct FunctionPreset {
+  const char* id;
+  const char* name;
+  uint16_t usage = 0;
+  uint8_t key = 0;
+  bool globe = false;
+};
+inline constexpr FunctionPreset kFunctionPresets[] = {
+  {"volume_up", "音量＋（連続）", 0xE9, 0}, {"volume_down", "音量－（連続）", 0xEA, 0},
+  {"play_pause", "再生／一時停止", 0xCD, 0}, {"mute", "消音", 0xE2, 0},
+  {"next", "次の曲", 0xB5, 0}, {"previous", "前の曲", 0xB6, 0},
+  {"home", "ホーム", 0, 11}, {"switch_app", "アプリ切り替え", 0, 43},
+  {"siri_key", "Siriを起動", 0, kKeyS, true}, {"globe", "地球儀（🌐）", 0, 0, true},
+  {"passcode", "パスコード送信（長押し専用）", 0, 0},
+};
+inline const Macro* findMacro(const std::vector<Macro>& macros, std::string_view id) {
+  for (const auto& m : macros) if (m.id == id) return &m;
+  return nullptr;
+}
+inline bool validConsumerUsage(int usage) {
+  if (usage == 0xB7) return true; // Stop is available as a macro step.
+  for (const auto& preset : kFunctionPresets) if (usage && usage == preset.usage) return true;
   return false;
+}
+inline const Macro* findAction(const Config& cfg, std::string_view action) {
+  if (action.substr(0, 6) == "macro:") return findMacro(cfg.macros, action.substr(6));
+  const auto* function = findMacro(cfg.functions, action);
+  return function ? function : findMacro(cfg.macros, action);
+}
+inline bool isAction(const Config& cfg, const std::string& a) {
+  if (a == "none" || findMacro(cfg.functions, a)) return true;
+  if (a.rfind("macro:", 0) == 0) return findAction(cfg, a);
+  return a == "maps" || a == "youtube" || a == "siri" || a == "lock" || a == "app_list";
 }
 inline bool validId(const std::string& s) {
   if (s.empty() || s.size() > 24) return false;
@@ -91,7 +123,7 @@ inline bool validId(const std::string& s) {
                          (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
   return true;
 }
-inline const char* validateMacroSteps(const std::vector<Step>& steps) {
+inline const char* validateMacroSteps(const std::vector<Step>& steps, uint32_t passcodeDuration = 0) {
   if (steps.empty() || steps.size() > 32) return "マクロの形式が不正です";
   uint32_t total = 0;
   for (const auto& s : steps) {
@@ -99,16 +131,20 @@ inline const char* validateMacroSteps(const std::vector<Step>& steps) {
       if (s.ms > 10000) return "待ち時間は10000ms以内にしてください";
       total += s.ms;
     } else if (s.type == "chord") {
-      if (s.key < 4 || s.key > 115 || s.modifiers < 0 || s.modifiers > 255) return "HIDキーコードまたは修飾キーが不正です";
+      const bool modifierOnly = s.key == 0 && (s.modifiers > 0 || s.globe);
+      if ((!modifierOnly && (s.key < 4 || s.key > 115)) || s.modifiers < 0 || s.modifiers > 255)
+        return "HIDキーコードまたは修飾キーが不正です";
       total += 60;
     } else if (s.type == "media") {
-      if (s.usage != 0xE9 && s.usage != 0xEA && s.usage != 0xE2 && s.usage != 0xCD && s.usage != 0xB5 && s.usage != 0xB6 && s.usage != 0xB7)
-        return "未対応のメディアキーです";
+      if (!validConsumerUsage(s.usage)) return "未対応のメディアキーです";
       total += 60;
     } else if (s.type == "text") {
       if (s.text.empty() || s.text.size() > 128) return "文字列は1〜128文字にしてください";
       for (unsigned char ch : s.text) if (ch < 32 || ch > 126) return "文字列入力は半角英数・ASCII記号に対応します";
       total += s.text.size() * 60;
+    } else if (s.type == "passcode" && passcodeDuration) {
+      total += passcodeDuration;
+      passcodeDuration = 0;
     } else return "未対応のマクロステップです";
   }
   if (total > 30000) return "マクロの合計実行時間は30秒以内にしてください";
@@ -137,6 +173,13 @@ inline std::string validate(const Config& c) {
       return "回路定数・未押下範囲・ヒステリシスが不正です";
   }
   if (c.buttons.size() > kMaxButtons || c.macros.size() > 16) return "ボタンまたはマクロの登録数が上限を超えています";
+  if (c.functions.size() != std::size(kFunctionPresets)) return "機能プリセットのIDが不正です";
+  for (const auto& preset : kFunctionPresets) {
+    const auto* function = findMacro(c.functions, preset.id);
+    if (!function || function->name.empty() || function->name.size() > 96) return "機能プリセットが不正です";
+    const auto duration = function->id == "passcode" ? c.wakeDelayMs + (12 + c.wakeSpace) * 60 : 0;
+    if (const auto* error = validateMacroSteps(function->steps, duration)) return error;
+  }
   for (size_t i = 0; i < c.macros.size(); ++i) {
     const auto& m = c.macros[i];
     if (!validId(m.id) || m.name.empty() || m.name.size() > 96) return "マクロの形式が不正です";

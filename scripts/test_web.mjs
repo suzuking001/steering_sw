@@ -7,15 +7,25 @@ import {tmpdir} from 'node:os';
 import {resolve,join} from 'node:path';
 import {once} from 'node:events';
 import assert from 'node:assert/strict';
+import {gunzipSync} from 'node:zlib';
 const root=resolve(import.meta.dirname,'..'), binary=join(root,'.pio/native-tests/test_main');
 const fixture=()=>JSON.parse(execFileSync(binary,['--fixture'],{encoding:'utf8'}));
+const embeddedAssets = new Map();
+if (process.argv.includes('--embedded')) {
+  const header = await readFile(join(root,'.pio/build/esp32dev/generated/web_assets.h'),'utf8');
+  for (const [file,symbol] of [['index.html','web_index'],['app.js','web_js'],['style.css','web_css']]) {
+    const bytes = header.match(new RegExp(symbol+'\\[\\] PROGMEM = \\{([\\d,]+)\\}'))[1];
+    embeddedAssets.set(file,gunzipSync(Buffer.from(bytes.split(',').map(Number))));
+  }
+}
 let fixtureCsrf='fixture-csrf',inputModePaused=false,delayInputMode=false,delayInputResume=false;
 let pausedTestRequests=0;
 const inputModeRequests=[];
-let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,rejectNextPin=false;
+let wifiState='unconfigured',wifiError='',wifiPasswordSet=false,wifiAttempts=0,rejectNextWifiSave=false;
+let rejectNextOrderSave=false;
 let failStatus=false,statusDelayMs=0,wifiDisconnectCount=0,wifiLastDisconnectReason=0;
-const savedWifiRequests=[],saveOrder=[];
-let state=fixture(),learning=null,learningAt=0,passcodeSet=false,testedActions=[];
+const savedWifiRequests=[];
+let state=fixture(),learning=null,learningAt=0,testedActions=[];
 const testedMacros=[];
 let macroBusy=false, stopRequests=0;
 let bleAttached=true, bleEncrypted=true, bleReconnectRequests=0;
@@ -58,7 +68,7 @@ const server=http.createServer(async(req,res)=>{
     if(!req.url.startsWith('/api/')){
       const file={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}[req.url];
       if(!file){res.writeHead(404);res.end();return;}
-      res.writeHead(200,{'Content-Type':file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html; charset=utf-8','Content-Security-Policy':csp});res.end(await readFile(join(root,'web',file)));return;
+      res.writeHead(200,{'Content-Type':file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html; charset=utf-8','Content-Security-Policy':csp});res.end(embeddedAssets.get(file) ?? await readFile(join(root,'web',file)));return;
     }
     let raw='';for await(const part of req)raw+=part;
     const body=raw?JSON.parse(raw):{};
@@ -89,15 +99,22 @@ const server=http.createServer(async(req,res)=>{
         protocolMode:bleProtocol,reportMapRead:bleMapRead,disconnectReason:bleDisconnectReason,securityError:bleSecurityError,bonds:1,
         advertisingIntervalMs:!paused&&!connected?20:undefined,automaticReconnects:1,serviceRefreshes:1,serviceRefreshConfirmations:0,
         automaticRetryUsed:true,automaticRetryExhausted:bleRetryExhausted};
-      reply(200,{...readingFrame(after),outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:ble.keyboardReady||ble.mediaReady,bleSuspended:paused,ble,busy:macroBusy,passcodeSet,accMv:2000,
+      reply(200,{...readingFrame(after),outputEnabled:state.outputEnabled,bleConnected:connected,bleReady:ble.keyboardReady||ble.mediaReady,bleSuspended:paused,ble,busy:macroBusy,passcodeSet:true,accMv:2000,
         firmware,learning:{active:!!learning&&!done,done:!!done,channel:learning?.channel||0,count:400,error:'',remainingMs:done?0:200,center:3895,minimum:3890,maximum:3900,tolerance:15},
         wifiConfigured:!!state.ssid,wifiSavedSsid:state.ssid,wifiPasswordSet,wifiState,wifiError,wifiAttempts,wifiDisconnectCount,wifiLastDisconnectReason,wifiConnectedSsid:wifiState==='connected'?state.ssid:'',wifiConnected:wifiState==='connected',ip:wifiState==='connected'?'192.168.0.45':'0.0.0.0',wifiLanUrl:wifiState==='connected'?'http://192.168.0.45/':'',mdnsReady:wifiState==='connected',rssi:-45,apActive:true,apName:'SteeringSW-test',apIp:'192.168.4.1',freeHeap:140000,logs:includeLogs?[{at:100,message:'Webテスト：実機のBLE・NVSは未検証'}]:undefined});return;
     }
     if(path==='config'&&req.method==='GET'||path==='backup'){reply(200,state);return;}
     if(path==='defaults'){const data=fixture();data.ssid=state.ssid;reply(200,data);return;}
+    if(path==='functions/defaults'&&req.method==='POST'){
+      state=JSON.parse(execFileSync(binary,['--reset-functions'],{input:JSON.stringify(state),encoding:'utf8'}));
+      reply(200,state);return;
+    }
     if(['config','validate','restore'].includes(path)){
       try{
         const patch=req.method==='PATCH';
+        if(patch && body.functionOrder && rejectNextOrderSave) {
+          rejectNextOrderSave=false;reply(507,{error:'並び順を保存できませんでした'});return;
+        }
         const parsed=JSON.parse(execFileSync(binary,[patch?'--patch':'--validate'],{
           input:JSON.stringify(patch?{current:state,changes:body}:body),encoding:'utf8',stdio:['pipe','pipe','pipe'],
         }));
@@ -140,10 +157,13 @@ const server=http.createServer(async(req,res)=>{
       if(!state.ble.enabled){reply(409,{error:'Bluetoothを有効にしてください'});return;}
       bleReconnectRequests++;bleAttached=false;reply(200,{message:'Bluetoothの再接続を待っています'});return;
     }
-    if(path==='passcode'){if(rejectNextPin){rejectNextPin=false;reply(507,{error:'保存できませんでした'});return;}saveOrder.push('passcode');passcodeSet=!!body.passcode;reply(200,{message:'パスコード更新'});return;}
-    if(path==='wifi'){if(body.ssid&&body.ssid!==state.ssid&&!Object.hasOwn(body,'password')){reply(400,{error:'新しいWi-Fiのパスワードを入力してください'});return;}savedWifiRequests.push(body);saveOrder.push('wifi');state.ssid=body.ssid;if(Object.hasOwn(body,'password'))wifiPasswordSet=!!body.password;wifiState=state.ssid?'connecting':'unconfigured';wifiAttempts=1;reply(200,{message:'Wi-Fi設定保存'});return;}
+    if(path==='wifi'){
+      if(rejectNextWifiSave){rejectNextWifiSave=false;reply(507,{error:'保存できませんでした'});return;}
+      if(body.ssid&&body.ssid!==state.ssid&&!Object.hasOwn(body,'password')){reply(400,{error:'新しいWi-Fiのパスワードを入力してください'});return;}
+      savedWifiRequests.push(body);state.ssid=body.ssid;if(Object.hasOwn(body,'password'))wifiPasswordSet=!!body.password;wifiState=state.ssid?'connecting':'unconfigured';wifiAttempts=1;reply(200,{message:'Wi-Fi設定保存'});return;
+    }
     if(path==='wifi/reconnect'){wifiState='connecting';wifiAttempts++;reply(200,{message:'再接続を開始しました'});return;}
-    if(path==='reset'){state=fixture();passcodeSet=false;reply(200,{message:'初期化しました'});return;}
+    if(path==='reset'){state=fixture();reply(200,{message:'初期化しました'});return;}
     if(path==='stop'){stopRequests++;macroBusy=false;reply(200,{message:'送信を停止しました'});return;}
     if(['reboot','ble/forget'].includes(path)){reply(200,{message:'完了'});return;}
     reply(404,{error:'unknown endpoint'});
@@ -166,6 +186,33 @@ try{
   function call(method,params={}){return new Promise((resolve,reject)=>{const id=++sequence;pending.set(id,{resolve,reject});ws.send(JSON.stringify({id,method,params}));});}
   async function evaluate(expression){const out=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(out.exceptionDetails)throw new Error(out.exceptionDetails.exception?.description||out.exceptionDetails.text);return out.result?.value;}
   async function wait(expression){for(let i=0;i<150;i++){if(await evaluate(expression))return;await new Promise(r=>setTimeout(r,100));}throw new Error('Timed out: '+expression);}
+  async function dragFunction(from,to) {
+    const [start,end]=await evaluate(`[${JSON.stringify(from)},${JSON.stringify(to)}].map(action=>{
+      const row=document.querySelector('#macro-list [data-action="'+action+'"]');
+      const {left,top,width,height}=row.getBoundingClientRect();
+      return {x:left+width/2,y:top+height/2};
+    })`);
+    await call('Input.setInterceptDrags',{enabled:true});
+    let dropData;
+    const intercept=event=>{
+      const message=JSON.parse(event.data);
+      if (message.method==='Input.dragIntercepted') dropData=message.params.data;
+    };
+    ws.addEventListener('message',intercept);
+    try {
+      await call('Input.dispatchMouseEvent',{type:'mouseMoved',...start});
+      await call('Input.dispatchMouseEvent',{type:'mousePressed',...start,button:'left',buttons:1,clickCount:1});
+      await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:start.x+12,y:start.y,button:'left',buttons:1});
+      for (let i=0;i<30&&!dropData;i++) await new Promise(resolve=>setTimeout(resolve,25));
+      assert.ok(dropData,'Chromium did not start a drag on the function');
+      for (const type of ['dragEnter','dragOver','drop'])
+        await call('Input.dispatchDragEvent',{type,...end,data:dropData});
+      await call('Input.dispatchMouseEvent',{type:'mouseReleased',...end,button:'left',buttons:0});
+    } finally {
+      ws.removeEventListener('message',intercept);
+      await call('Input.setInterceptDrags',{enabled:false});
+    }
+  }
   await call('Page.enable');await call('Runtime.enable');
   await call('Page.addScriptToEvaluateOnNewDocument',{source:`globalThis.fill=(root,label,value)=>{
     const node=[...document.querySelector(root).querySelectorAll('label')]
@@ -176,7 +223,7 @@ try{
   await call('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
   await call('Page.navigate',{url});await wait('!document.getElementById("workspace").hidden && currentStatus !== undefined');
   check(await evaluate('!document.getElementById("login-form") && !document.getElementById("admin-form") && !document.getElementById("logout")'),'local network opens settings without Web login or password controls');
-  check(await evaluate('document.querySelectorAll(".button-card").length === 9 && document.querySelectorAll(".macro-card").length === 5'),'nine buttons and five editable shortcuts render');
+  check(await evaluate('document.querySelectorAll(".button-card").length === 9 && document.querySelectorAll("#macro-list button").length === 16'),'nine buttons and sixteen editable presets render');
   check(await evaluate('activeTab==="buttons" && document.querySelectorAll("nav [data-tab]").length===3'),'opens directly to button assignments with three tabs');
   check(await evaluate('!document.querySelector("footer, #save, #discard")'),'there is no fixed global save bar');
   const idleStart=statusRequests.length;
@@ -361,10 +408,16 @@ try{
   }
   check(testedActions.slice(-3).join(',')===cardActions.join(',') && state.buttons[9].shortAction==='none',
     'each test button previews its selected action without saving the assignment');
+  for (const action of ['siri_key','globe']) {
+    await evaluate(`setAction(2,${JSON.stringify(action)});document.getElementById('message').hidden=true;testButtons()[2].click();`);
+    await wait('!testPending && !document.getElementById("message").hidden && document.getElementById("message").textContent.includes("テストを開始")');
+  }
+  check(testedActions.slice(-2).join(',')==='siri_key,globe','Siri and Globe can be tested directly from button assignments');
+  const beforeStaleTest=testedActions.length;
   await evaluate(`config.macros.find(macro=>macro.id==='maps').steps[0].key=35;
     setAction(2,'maps');testButtons()[2].click();`);
-  await wait('document.getElementById("message").textContent.includes("マクロの変更を保存")');
-  check(testedActions.at(-1)==='previous','a card does not test a stale macro definition');
+  await wait('document.getElementById("message").textContent.includes("機能の変更を保存")');
+  check(testedActions.length===beforeStaleTest,'a card does not test a stale macro definition');
   await evaluate(`config.macros.find(macro=>macro.id==='maps').steps=clone(saved.macros.find(macro=>macro.id==='maps').steps);setAction(2,'previous');`);
   await evaluate(`
     document.querySelector(newCard+' details').open=true;
@@ -398,25 +451,87 @@ try{
   check(inputModeRequests.length===pausesBeforeIdleCapture && state.channels[0].idleCenter===3050 && state.channels[1].idleCenter===3100,
     'idle values can be saved without pausing Bluetooth');
   await evaluate(`document.querySelector('[data-tab="macros"]').click();`);
-  check(await evaluate(`globalThis.macroShortcut=()=>[...document.querySelectorAll('.shortcut-value')].map(label=>label.textContent);
-    const initial=macroShortcut();
-    fill('#macro-cards .macro-card:nth-child(2)','HIDキー番号（10進数）',30);
-    [...document.querySelectorAll('#macro-cards .macro-card:nth-child(2) .modifiers input')].slice(0,2).forEach(input=>input.click());
-    initial[0]==='Control＋Option＋Shift＋1' && initial[1]==='Control＋Option＋Shift＋2' &&
-    macroShortcut()[1]==='Option＋1'`), 'preset chords reflect the actual key and modifiers');
-  await evaluate(`globalThis.siriCard='[data-macro-id="siri"]';
-    document.querySelector(siriCard+' .open-shortcut').click();
+  check(await evaluate(`document.querySelector('[data-tab="macros"]').textContent==='機能割当' &&
+    [...document.querySelectorAll('#macro-list button')].every((row,i)=>row.textContent===[...config.functions,...config.macros][i].name && !row.children.length) &&
+    !document.querySelector('#tab-macros .step')`), 'feature assignments list only function names');
+  check(await evaluate(`const choices=document.querySelector('[data-button-id="mode"] .button-actions > :last-child select');
+    [...choices.options].filter(option=>option.value!=='none').every(option=>
+      [...document.querySelectorAll('#macro-list [data-macro-id]')].some(row=>row.dataset.macroId===option.value&&row.textContent===option.textContent))`),
+    'all built-in choices in button assignments have a corresponding feature editor');
+  check(await evaluate(`globalThis.openFeature=id=>document.querySelector('#macro-list [data-macro-id="'+id+'"]').click();
+    openFeature('youtube');
+    const initial=document.querySelector('#macro-fields .shortcut-value').textContent;
+    fill('#macro-fields','HIDキー番号（10進数）',30);
+    document.querySelectorAll('#macro-fields .modifiers input:is([value="1"], [value="2"])').forEach(input=>input.click());
+    initial==='Control＋Option＋Shift＋2' && document.querySelector('#macro-fields .shortcut-value').textContent==='Option＋1'`),
+    'the modal shows the preset chord and its editing controls');
+  await call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await call('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await call('Input.dispatchMouseEvent',{type:'mousePressed',x:5,y:5,button:'left',clickCount:1});
+  await call('Input.dispatchMouseEvent',{type:'mouseReleased',x:5,y:5,button:'left',clickCount:1});
+  check(await evaluate('document.getElementById("macro-dialog").open && hasChanges() && macroDraft.steps[0].key===30'),
+    'Escape and backdrop clicks leave the editor and its draft open');
+  await evaluate(`document.getElementById('discard-macro').click()`);
+  check(state.macros[1].steps[0].key===31 && await evaluate('!document.getElementById("macro-dialog").open && !hasMacroEdits()'),
+    'explicit discard closes the editor without changing the stored function');
+  await evaluate(`openFeature('siri');document.querySelector('#macro-fields .open-shortcut').click();
     document.getElementById('shortcut-test').click();`);
   await wait('document.getElementById("shortcut-feedback").textContent.includes("キー送信が無効")');
   check(testedMacros.length===0,'the keyboard test respects the saved key output setting');
-  await evaluate(`document.getElementById('shortcut-cancel').click();document.querySelector('[data-tab="settings"]').click();
+  await evaluate(`document.getElementById('shortcut-cancel').click();document.getElementById('discard-macro').click();document.querySelector('[data-tab="settings"]').click();
     document.getElementById('output-enabled-input').click();document.getElementById('save-general').click();`);
   await wait('saved.outputEnabled && !saving');
-  await evaluate(`document.querySelector('[data-tab="macros"]').click();document.querySelector(siriCard+' .open-shortcut').click();
+  await evaluate(`document.querySelector('[data-tab="macros"]').click();openFeature('volume_up');`);
+  check(await evaluate(`macroDraft.steps[0].usage===233 && document.getElementById('delete-macro').hidden &&
+    document.querySelector('#macro-fields .step select').selectedOptions[0].textContent==='メディアキー'`),
+    'the volume preset opens with its original media key and is protected from deletion');
+  await evaluate(`fill('#macro-fields','機能名','音量調整');
+    const volumeKey=document.querySelectorAll('#macro-fields .step select')[1];
+    volumeKey.value='226';volumeKey.dispatchEvent(new Event('change'));
+    document.getElementById('save-macro').click();`);
+  await wait('!document.getElementById("macro-dialog").open && saved.functions[0].name==="音量調整"');
+  check(state.functions[0].steps[0].usage===226 && state.buttons.find(button=>button.id==='plus').shortAction==='volume_up' &&
+    await evaluate('document.querySelector(\'[data-button-id="plus"] .button-actions select\').selectedOptions[0].textContent==="音量調整"'),
+    'editing a preset changes the selected action label and steps without reassigning the physical button');
+  await evaluate(`openFeature('maps');fill('#macro-fields','機能名','地図の変更');document.getElementById('save-macro').click();`);
+  await wait('!document.getElementById("macro-dialog").open && saved.macros[0].name==="地図の変更"');
+  await evaluate(`document.querySelector('[data-tab="macros"]').click();openFeature('siri');document.querySelector('#macro-fields .open-shortcut').click();`);
+  check(await evaluate(`const keys=[...document.querySelectorAll('#shortcut-keys [data-key]')].map(button=>+button.dataset.key).sort((a,b)=>a-b);
+    keys.length===112 && keys.every((key,index)=>key===index+4) &&
+    document.querySelector('#shortcut-keys [data-key="57"]').textContent==='Caps Lock' &&
+    document.querySelector('#shortcut-keys [data-key="74"]').textContent==='Home' &&
+    document.querySelector('#shortcut-more [data-key="115"]').textContent==='F24'`),
+    'the keyboard exposes each supported normal HID key exactly once');
+  await evaluate(`document.querySelector('#shortcut-keys [data-key="57"]').click();document.getElementById('shortcut-test').click();`);
+  await wait('!testPending && document.getElementById("shortcut-feedback").textContent.includes("送信を開始")');
+  check(testedMacros.at(-1)[0].key===57,'Caps Lock sends its HID key');
+  check(await evaluate(`{const caps=document.querySelector('#shortcut-keys [data-key="57"]');
+    caps.click();
+    caps.getAttribute('aria-pressed')==='false' && shortcutDraft.key===0 && shortcutDraft.modifiers===7 &&
+      !document.getElementById('shortcut-apply').disabled;}`),
+    'tapping a selected key again leaves the chosen modifiers active');
+  check(await evaluate(`const home=document.querySelector('#shortcut-keys [data-key="74"]');
+    home.click();
+    const homeKey=shortcutDraft.key;
+    home.click();
+    homeKey===74 && shortcutDraft.key===0 &&
+      !document.querySelector('#shortcut-keys [data-home], #shortcut-keys [data-usage]') &&
+      !document.getElementById('shortcut-dialog').textContent.includes('Siri')`),
+    'the picker shows the physical Home key without dedicated Home-screen and Siri actions');
+  await evaluate(`document.getElementById('shortcut-more').open=true;
+    document.querySelectorAll('#shortcut-dialog [data-modifier][aria-pressed="true"]').forEach(button=>button.click());`);
+  check(await evaluate('document.getElementById("shortcut-test").disabled && document.querySelectorAll("[data-modifier]").length===8'),
+    'all eight modifiers are available and a completely empty report cannot be tested');
+  await evaluate(`document.querySelector('#shortcut-more [data-modifier="16"]').click();document.getElementById('shortcut-test').click();`);
+  await wait('!testPending && document.getElementById("shortcut-feedback").textContent.includes("送信を開始")');
+  check(testedMacros.at(-1)[0].key===0 && testedMacros.at(-1)[0].modifiers===16 &&
+    await evaluate('document.getElementById("shortcut-selection").textContent==="右Control"'),
+    'a right-side modifier can be sent by itself');
+  await evaluate(`document.getElementById('shortcut-cancel').click();document.querySelector('#macro-fields .open-shortcut').click();
     document.querySelector('#shortcut-keys [data-key="11"]').click();
-    document.querySelector('#shortcut-modifiers [data-modifier="136"]').click();`);
+    document.querySelector('#shortcut-modifiers [data-modifier="8"]').click();`);
   check(await evaluate(`document.getElementById('shortcut-selection').textContent==='Control＋Option＋Shift＋Command＋H' &&
-    config.macros.find(m=>m.id==='siri').steps[0].key===32`),'the visual keyboard selects a chord without editing the macro yet');
+    macroDraft.steps[0].key===32`),'the visual keyboard selects a chord without editing the function yet');
   await evaluate(`document.getElementById('shortcut-test').click();`);
   await wait('document.getElementById("shortcut-feedback").textContent.includes("送信を開始")');
   await call('Input.dispatchKeyEvent',{type:'keyDown',key:'H',code:'KeyH',modifiers:15});
@@ -434,26 +549,108 @@ try{
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'shortcut-keyboard.png'),Buffer.from(shot.data,'base64'));
   await call('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
   await evaluate(`document.getElementById('shortcut-cancel').click();`);
-  check(state.macros[2].steps[0].key===32 && await evaluate('config.macros[2].steps[0].key===32'),
-    'cancel leaves the saved macro and its draft unchanged');
-  await evaluate(`document.querySelector(siriCard+' .open-shortcut').click();document.querySelector('#shortcut-keys [data-key="11"]').click();
-    document.getElementById('shortcut-apply').click();document.querySelector(siriCard+' .test-macro').click();`);
-  await wait('!testPending && document.getElementById("message").textContent.includes("テストを開始")');
+  check(state.macros[2].steps[0].key===32 && await evaluate('document.getElementById("macro-dialog").open && macroDraft.steps[0].key===32'),
+    'closing the nested keyboard returns to the function editor without taking the key');
+  await evaluate(`document.querySelector('#macro-fields .open-shortcut').click();document.querySelector('#shortcut-keys [data-key="11"]').click();
+    document.getElementById('shortcut-apply').click();document.querySelector('#macro-fields .test-macro').click();`);
+  await wait('!testPending && document.getElementById("macro-feedback").textContent.includes("テストを開始")');
   check(testedMacros.at(-1)[0].key===11 && state.macros[2].steps[0].key===32 &&
-    await evaluate('config.macros[2].steps[0].key===11 && document.querySelector(siriCard+" .shortcut-value").textContent.endsWith("H")'),
-    'applying a key updates the draft and the macro test runs that draft while the stored macro remains intact');
-  await evaluate(`document.querySelector(siriCard+' .cancel-item').click();`);
-  await evaluate(`document.querySelector('[data-macro-id="youtube"] .cancel-item').click();document.getElementById('add-macro').click();`);
-  check(await evaluate('config.macros.length===6 && document.querySelectorAll(".macro-card").length===6'),'custom macros can be added');
-  await evaluate(`fill('#macro-cards','マクロ名','未保存マクロ');[...document.querySelectorAll('#macro-cards .save-item')].at(-1).click()`);
-  await wait('!saving && saved.macros.length===6');
-  check(state.macros[0].name!=='未保存マクロ' && await evaluate('dirty'),'saving a custom macro leaves another edited macro unsaved');
-  await evaluate(`document.querySelector('[data-macro-id="maps"] .test-macro').click()`);
-  await wait('document.getElementById("message").textContent.includes("テストを開始")');
-  check(testedMacros.at(-1)[0].key===30,'macro test submits the card steps even while another card is being edited');
-  await evaluate(`document.querySelector('[data-macro-id="maps"] .cancel-item').click()`);
-  await evaluate(`document.querySelector('[data-tab="settings"]').click();document.getElementById('passcode').value='4826';document.getElementById('passcode-form').requestSubmit();`);
-  await wait('currentStatus.passcodeSet===true');check(await evaluate('document.getElementById("passcode").value==="4826" && document.getElementById("passcode-feedback").textContent.includes("保存")'),'passcode field remains populated with a saved indicator');
+    await evaluate('macroDraft.steps[0].key===11 && config.macros[2].steps[0].key===32 && document.querySelector("#macro-fields .shortcut-value").textContent.endsWith("H")'),
+    'the function test sends the modal draft while the stored function remains intact');
+  await evaluate(`const operation=document.querySelector('#macro-fields .step select');
+    operation.value='media';operation.dispatchEvent(new Event('change'));`);
+  check(await evaluate(`const selects=document.querySelectorAll('#macro-fields .step select');
+    selects[0].selectedOptions[0].textContent==='メディアキー' &&
+    [...selects[1].options].map(option=>+option.value).join(',')==='233,234,226,205,181,182,183'`),
+    'the media picker contains audio and playback keys only');
+  await evaluate(`{const operation=document.querySelector('#macro-fields .step select');
+    operation.value='chord';operation.dispatchEvent(new Event('change'));}`);
+  await evaluate(`document.querySelector('#macro-fields .open-shortcut').click();`);
+  check(await evaluate(`const globe=document.querySelector('#shortcut-modifiers [data-globe]');
+    globe.click();
+    const withGlobe=globe.getAttribute('aria-pressed')==='true' && shortcutDraft.key===30;
+    const shift=document.querySelector('#shortcut-modifiers [data-modifier="2"]');
+    shift.click();
+    const withShift=shortcutDraft.globe && shortcutDraft.modifiers===2;
+    shift.click();
+    globe.click();
+    withGlobe && withShift && globe.getAttribute('aria-pressed')==='false' && shortcutDraft.key===30`),
+    'Globe can be combined with a regular key and other modifiers');
+  await evaluate(`document.querySelector('#shortcut-modifiers [data-globe]').click();
+    document.querySelector('#shortcut-keys [data-key="22"]').click();
+    document.getElementById('shortcut-test').click();`);
+  await wait('!testPending && document.getElementById("shortcut-feedback").textContent.includes("送信を開始")');
+  assert.deepEqual(testedMacros.at(-1), [{type:'chord',key:22,modifiers:0,globe:true}]);
+  await evaluate(`document.getElementById('shortcut-apply').click();`);
+  check(await evaluate(`macroDraft.steps[0].globe && macroDraft.steps[0].key===22 &&
+      document.querySelector('#macro-fields .shortcut-value').textContent==='地球儀＋S'`),
+    'the keyboard picker tests and applies Globe plus S as one chord');
+  await evaluate(`document.getElementById('discard-macro').click();document.getElementById('add-macro').click();`);
+  check(await evaluate(`document.getElementById("macro-dialog").open && config.macros.length===5 &&
+    document.querySelectorAll("#macro-list button").length===16`),'adding a function opens a draft without putting it in the list');
+  await call('Emulation.setDeviceMetricsOverride',{width:820,height:1180,deviceScaleFactor:1,mobile:true});
+  check(await evaluate(`for (let i=0;i<16;i++) {
+      [...document.querySelectorAll('#macro-fields button')].find(button=>button.textContent==='ステップ追加').click();
+    }
+    const editor=document.getElementById('macro-scroll'), toolbar=document.querySelector('.macro-dialog-header');
+    editor.scrollHeight>editor.clientHeight && toolbar.getBoundingClientRect().bottom<=editor.getBoundingClientRect().top &&
+      toolbar.getBoundingClientRect().top>=0`),
+    'a long editor scrolls internally and keeps its save and discard buttons visible on a tablet');
+  shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'function-editor.png'),Buffer.from(shot.data,'base64'));
+  await call('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
+  await evaluate(`document.getElementById('discard-macro').click();`);
+  check(state.macros.length===5 && await evaluate('!document.getElementById("macro-dialog").open && config.macros.length===5'),
+    'discarding a new function adds nothing');
+  await evaluate(`document.getElementById('add-macro').click();fill('#macro-fields','機能名','');document.getElementById('save-macro').click();`);
+  await wait('document.getElementById("macro-feedback").classList.contains("error")');
+  check(state.macros.length===5 && await evaluate('document.getElementById("macro-dialog").open && macroDraft.name===""'),
+    'a rejected save leaves the editor open and retains the input');
+  await evaluate(`fill('#macro-fields','機能名','地球儀テスト');
+    {const operation=document.querySelector('#macro-fields .step select');
+    operation.value='chord';operation.dispatchEvent(new Event('change'));}
+    document.querySelector('#macro-fields .open-shortcut').click();
+    document.querySelector('#shortcut-modifiers [data-globe]').click();
+    document.querySelector('#shortcut-keys [data-key="30"]').click();
+    document.getElementById('shortcut-apply').click();document.getElementById('save-macro').click()`);
+  await wait('!document.getElementById("macro-dialog").open && saved.macros.length===6');
+  check(state.macros.at(-1).name==='地球儀テスト' && state.macros.at(-1).steps[0].globe && state.macros.at(-1).steps[0].key===0 &&
+    await evaluate('document.querySelector("#macro-list li:last-child button").textContent==="地球儀テスト"'),
+    'saving closes the dialog and adds the saved name to the list');
+  const customAction='macro:'+state.macros.at(-1).id;
+  await dragFunction('volume_up',customAction);
+  await wait('saved.functionOrder.endsWith(",volume_up") && !saving');
+  check(state.functionOrder.endsWith(customAction+',volume_up') &&
+    await evaluate('document.querySelector("#macro-list li:last-child").dataset.action==="volume_up" && !document.getElementById("macro-dialog").open'),
+    'a mouse drag moves a preset past a custom function, saves the order and leaves the editor closed');
+  rejectNextOrderSave=true;
+  await dragFunction('volume_up','volume_down');
+  await wait('document.getElementById("message").textContent.includes("並び順を保存できませんでした")');
+  check(state.functionOrder.endsWith(',volume_up') &&
+    await evaluate('document.querySelector("#macro-list li:last-child").dataset.action==="volume_up" && !dirty'),
+    'a failed order save restores the previous arrangement');
+  const calibratedButtons=cloneJSON(state.buttons), configuredSsid=state.ssid;
+  await evaluate(`document.querySelector('[data-tab="settings"]').click();document.getElementById('reset-functions').click();`);
+  await wait('!saving && saved.functions[0].name==="音量＋（連続）"');
+  assert.deepEqual(state.buttons,calibratedButtons);
+  check(state.functions[0].steps[0].usage===233 && state.macros[0].name===fixture().macros[0].name &&
+    state.macros.at(-1).name==='地球儀テスト' && state.outputEnabled && state.ssid===configuredSsid,
+    'the settings reset restores all preset steps and names while preserving custom functions and device settings');
+  await evaluate(`document.querySelector('[data-tab="macros"]').click();`);
+  check(await evaluate(`openFeature(config.macros.at(-1).id);document.querySelector('#macro-fields .open-shortcut').click();
+    document.querySelector('#shortcut-modifiers [data-globe]').getAttribute('aria-pressed')==='true' &&
+    !document.querySelector('#shortcut-keys [data-key][aria-pressed="true"]')`),
+    'reopening a saved Globe-only chord retains its selection');
+  await evaluate(`document.getElementById('shortcut-cancel').click();document.getElementById('delete-macro').click();`);
+  check(state.macros.length===6 && await evaluate('document.getElementById("macro-dialog").open && document.getElementById("macro-feedback").textContent.includes("保存すると")'),
+    'deletion stays in the editor until the user saves');
+  await evaluate(`document.getElementById('discard-macro').click();openFeature(config.macros.at(-1).id);
+    document.getElementById('delete-macro').click();document.getElementById('save-macro').click();`);
+  await wait('!document.getElementById("macro-dialog").open && saved.macros.length===5');
+  check(state.macros.length===5,'saving a staged deletion removes the function');
+  await evaluate(`document.querySelector('[data-tab="settings"]').click();`);
+  check(await evaluate(`currentStatus.passcodeSet===true && !document.querySelector('#passcode-form, #passcode') &&
+    !document.querySelector('#general-fields').textContent.includes('パスコード')`),
+    'device settings omit the passcode card and controls when a legacy passcode is stored');
   check(await evaluate(`api('backup').then(data=>!('passcode' in data)&&!('wifiPassword' in data)&&!('adminPassword' in data))`),'backup contains no secret fields');
   const imported=fixture();imported.name='復元テスト';imported.ssid='other-network';imported.outputEnabled=true;
   const importFile=join(profile,'restore.json');await writeFile(importFile,JSON.stringify(imported));
@@ -461,6 +658,11 @@ try{
   await call('DOM.setFileInputFiles',{nodeId:input.nodeId,files:[importFile]});
   await wait('config.name==="復元テスト"');
   check(await evaluate('dirty && config.outputEnabled===false && config.ssid===saved.ssid'),'restore stages validated config, disables output and preserves network');
+  await evaluate(`document.querySelector('[data-tab="macros"]').click();openFeature('maps');
+    fill('#macro-fields','機能名','復元後の機能');document.getElementById('save-macro').click();
+    document.querySelector('[data-tab="settings"]').click();`);
+  check(state.macros[0].name!=='復元後の機能' && await evaluate('config.macros[0].name==="復元後の機能" && previewingConfig && !document.getElementById("macro-dialog").open'),
+    'saving a function during restore updates the import draft without applying it to the device');
   const invalid=cloneJSON(imported);invalid.channels=[null,null];await writeFile(importFile,JSON.stringify(invalid));
   await call('DOM.setFileInputFiles',{nodeId:input.nodeId,files:[importFile]});
   await wait('document.getElementById("message").textContent.includes("不正")');
@@ -474,6 +676,10 @@ try{
   await call('Network.clearBrowserCookies');await call('Page.reload');
   await wait('typeof csrf !== "undefined" && csrf==="next-boot-csrf" && !document.getElementById("workspace").hidden && currentStatus !== undefined');
   check(await evaluate('csrf==="next-boot-csrf" && !document.getElementById("login-form")'),'fresh browser retrieves a new device token without a password or session cookie');
+  check(state.functionOrder.endsWith(',volume_up') &&
+    await evaluate(`!document.querySelector('#macro-list [data-action="'+${JSON.stringify(customAction)}+'"]')`) &&
+    await evaluate('document.querySelector("#macro-list li:last-child").dataset.action==="volume_up"'),
+    'a reload restores the saved arrangement without showing the deleted function');
   check(await evaluate(`fetch('/api/stop',{method:'POST'}).then(r=>r.status===403)`),'local access still rejects writes without CSRF');
   await evaluate(`document.querySelector('[data-tab="settings"]').click();globalThis.editingInput=document.querySelector('#general-fields input[type=text]');editingInput.focus();editingInput.value='端末で入力中';editingInput.dispatchEvent(new Event('input',{bubbles:true}));`);
   await new Promise(r=>setTimeout(r,650));
@@ -483,23 +689,21 @@ try{
   await evaluate(`
     document.getElementById('wifi-ssid').value='TestHome24';document.getElementById('wifi-ssid').dispatchEvent(new Event('input',{bubbles:true}));
     document.getElementById('wifi-password').value='test-pass-123';document.getElementById('wifi-password').dispatchEvent(new Event('input',{bubbles:true}));
-    document.getElementById('passcode').value='5931';document.getElementById('passcode').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('passcode').focus();
+    document.getElementById('wifi-password').focus();
   `);
   await new Promise(r=>setTimeout(r,650));
-  check(await evaluate('document.getElementById("wifi-password").value==="test-pass-123" && document.getElementById("passcode").value==="5931" && document.activeElement===document.getElementById("passcode")'),'Wi-Fi and passcode inputs remain populated and focused during polling');
-  check(await evaluate('wifiDirty && passcodeDirty && document.getElementById("save-general").disabled'),'Wi-Fi and passcode drafts have independent controls');
-  await evaluate(`document.getElementById('show-wifi-password').click();document.getElementById('show-passcode').click();`);
-  check(await evaluate('document.getElementById("wifi-password").type==="text" && document.getElementById("passcode").type==="text"'),'entered Wi-Fi password and passcode can be revealed');
-  const beforeIndependentSave=saveOrder.length;
+  check(await evaluate('document.getElementById("wifi-password").value==="test-pass-123" && document.activeElement.id==="wifi-password"'),'the Wi-Fi password stays populated and focused during polling');
+  check(await evaluate('wifiDirty && document.getElementById("save-general").disabled'),'a Wi-Fi draft does not dirty the general settings');
+  await evaluate(`document.getElementById('show-wifi-password').click();`);
+  check(await evaluate('document.getElementById("wifi-password").type==="text"'),'the entered Wi-Fi password can be revealed');
+  const beforeIndependentSave=savedWifiRequests.length;
   await evaluate(`fill('#general-fields','設定名','接続設定中');document.getElementById('save-general').click()`);
   await wait('!dirty');
-  check(state.name==='接続設定中' && saveOrder.length===beforeIndependentSave && await evaluate('wifiDirty && passcodeDirty'),
-    'saving device settings does not submit Wi-Fi or passcode drafts');
-  await evaluate(`document.getElementById('passcode-form').requestSubmit()`);await wait('!passcodeDirty');
-  check(await evaluate('wifiDirty'),'saving the passcode leaves the Wi-Fi draft intact');
+  check(state.name==='接続設定中' && savedWifiRequests.length===beforeIndependentSave && await evaluate('wifiDirty'),
+    'saving device settings does not submit the Wi-Fi draft');
   await evaluate(`document.getElementById('wifi-form').requestSubmit()`);await wait('!hasChanges() && currentStatus.wifiSavedSsid==="TestHome24"');
-  check(state.ssid==='TestHome24'&&saveOrder.at(-1)==='wifi','the Wi-Fi form saves and starts the connection');
-  check(await evaluate('document.getElementById("wifi-password").value==="test-pass-123" && document.getElementById("passcode").value==="5931"'),'saving does not clear either secret input');
+  check(state.ssid==='TestHome24'&&savedWifiRequests.length===beforeIndependentSave+1,'the Wi-Fi form saves and starts the connection');
+  check(await evaluate('document.getElementById("wifi-password").value==="test-pass-123"'),'the Wi-Fi password remains populated after saving');
   check(await evaluate('document.getElementById("wifi-saved-state").textContent.includes("TestHome24") && document.getElementById("wifi-connection-state").textContent.includes("接続中")'),'Wi-Fi saved state is distinct from connection progress');
   wifiState='failed';wifiError='認証に失敗しました。パスワードを確認してください。';
   await wait('document.getElementById("wifi-connection-state").textContent.includes("認証に失敗")');
@@ -531,21 +735,21 @@ try{
   await evaluate(`document.getElementById('wifi-panel').scrollIntoView()`);
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'wifi-connected.png'),Buffer.from(shot.data,'base64'));
   await call('Page.reload');await wait('!document.getElementById("workspace").hidden && currentStatus?.wifiSavedSsid==="TestHome24" && document.getElementById("wifi-password").value===""');
-  check(await evaluate('document.getElementById("wifi-password").placeholder.includes("登録済み") && document.getElementById("passcode").placeholder.includes("登録済み") && document.getElementById("passcode").value===""'),'reload shows registered placeholders without reading saved secrets back');
+  check(await evaluate('document.getElementById("wifi-password").placeholder.includes("登録済み")'),'reload shows the Wi-Fi credential as registered without reading it back');
   await evaluate(`document.querySelector('[data-tab="settings"]').click();document.getElementById('wifi-ssid').value='DifferentNetwork';document.getElementById('wifi-ssid').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('wifi-form').requestSubmit();`);
   await wait('document.getElementById("wifi-feedback").textContent.includes("新しいWi-Fi")');
   check(await evaluate('document.getElementById("wifi-ssid").value==="DifferentNetwork" && wifiDirty'),'failed Wi-Fi save retains the draft and displays a persistent error');
   await evaluate(`document.getElementById('wifi-ssid').value='TestHome24';document.getElementById('wifi-ssid').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('wifi-form').requestSubmit();`);await wait('!wifiDirty');
   check(!Object.hasOwn(savedWifiRequests.at(-1),'password')&&wifiPasswordSet,'empty password for the saved SSID preserves the stored credential');
-  rejectNextPin=true;
-  await evaluate(`document.getElementById('passcode').value='6042';document.getElementById('passcode').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('passcode-form').requestSubmit();`);
-  await wait('document.getElementById("passcode-feedback").textContent.includes("保存できませんでした")');
-  check(await evaluate('document.getElementById("passcode").value==="6042" && passcodeDirty'),'passcode storage failure retains the entered value and unsaved state');
-  fixtureCsrf='restarted-token';const priorPinSaves=saveOrder.filter(x=>x==='passcode').length;
-  await evaluate(`document.getElementById('passcode-form').requestSubmit()`);await wait('!passcodeDirty');
-  check(saveOrder.filter(x=>x==='passcode').length===priorPinSaves+1&&await evaluate('csrf==="restarted-token" && document.getElementById("passcode").value==="6042"'),'device token refresh retries a rejected save once without losing input');
+  rejectNextWifiSave=true;
+  await evaluate(`fill('#wifi-form','Wi-Fiパスワード','updated-pass-123');document.getElementById('wifi-form').requestSubmit();`);
+  await wait('document.getElementById("wifi-feedback").textContent.includes("保存できませんでした")');
+  check(await evaluate('document.getElementById("wifi-password").value==="updated-pass-123" && wifiDirty'),'Wi-Fi storage failure retains the entered value and unsaved state');
+  fixtureCsrf='restarted-token';const priorWifiSaves=savedWifiRequests.length;
+  await evaluate(`document.getElementById('wifi-form').requestSubmit()`);await wait('!wifiDirty');
+  check(savedWifiRequests.length===priorWifiSaves+1&&await evaluate('csrf==="restarted-token" && document.getElementById("wifi-password").value==="updated-pass-123"'),'device token refresh retries a rejected save once without losing input');
   const beforeDesktopFocus=inputModeRequests.length;
-  await evaluate(`document.getElementById('wifi-password').focus();document.getElementById('passcode').focus()`);
+  await evaluate(`document.getElementById('wifi-password').focus();document.getElementById('wifi-ssid').focus()`);
   check(inputModeRequests.length===beforeDesktopFocus,'desktop password focus does not pause key output');
   await call('Page.addScriptToEvaluateOnNewDocument',{source:`
     Object.defineProperty(navigator,'platform',{value:'MacIntel'});
@@ -583,26 +787,26 @@ try{
   check(await evaluate('document.activeElement.id==="wifi-password" && document.getElementById("wifi-password").value==="Ab1!" && wifiDirty'),
     'the page keyboard enters a password with case, numbers, symbols and deletion');
   const beforeSwitch=inputModeRequests.length;
-  await evaluate(`document.getElementById('passcode').focus()`);
+  await evaluate(`document.getElementById('wifi-ssid').focus()`);
   await new Promise(resolve=>setTimeout(resolve,350));
   check(inputModeRequests.slice(beforeSwitch).every(request=>request.enabled) &&
-    await evaluate('document.activeElement.id==="passcode" && currentStatus.inputModePaused && currentStatus.bleConnected'),
+    await evaluate('document.activeElement.id==="wifi-ssid" && currentStatus.inputModePaused && currentStatus.bleConnected'),
     'moving between fields keeps key output paused with Bluetooth connected');
   await wait('!document.getElementById("field-keyboard").hidden');
-  await evaluate(`pressPageKey('0');pressPageKey('2');pressPageKey('4');pressPageKey('6');`);
-  check(await evaluate('document.getElementById("passcode").value==="0246" && passcodeDirty && !document.querySelector("#field-keyboard button").form.querySelector("#wifi-password")'),
-    'the numeric keypad enters a passcode including leading zeroes');
+  await evaluate(`document.getElementById('wifi-ssid').select();pressPageKey('0');pressPageKey('2');pressPageKey('4');pressPageKey('6');`);
+  check(await evaluate('document.getElementById("wifi-ssid").value==="0246" && document.getElementById("wifi-password").value==="Ab1!" && wifiDirty'),
+    'the page keyboard follows focus and enters digits in the SSID field');
   await evaluate(`pressPageKey('完了')`);
   await wait('!currentStatus.inputModePaused && !inputModeRequest');
   check(await evaluate('currentStatus.bleReady && document.getElementById("input-mode-help").hidden && document.getElementById("field-keyboard").hidden'),'finishing input closes the keypad and resumes key output');
   delayInputMode=true;
   const beforeQuickBlur=inputModeRequests.length;
-  await evaluate(`document.getElementById('passcode').focus();document.getElementById('passcode').blur()`);
+  await evaluate(`document.getElementById('wifi-ssid').focus();document.getElementById('wifi-ssid').blur()`);
   await wait('!inputModeDesired && !inputModeRequest');
   check(inputModeRequests.slice(beforeQuickBlur).map(request=>request.enabled).join(',')==='true,false',
     'a blur during a pending pause still sends a resume');
   delayInputMode=false;
-  await evaluate(`document.getElementById('passcode').focus()`);
+  await evaluate(`document.getElementById('wifi-ssid').focus()`);
   await wait('currentStatus.inputModePaused && !inputModeRequest');
   await evaluate(`window.dispatchEvent(new PageTransitionEvent('pagehide'))`);
   await wait('!inputModeRequested && !inputModeRequest');
@@ -615,7 +819,7 @@ try{
   check(await evaluate('document.getElementById("field-keyboard").hidden && currentStatus.bleReady'),
     'replacing an edited field returns the fallback keyboard and resumes output without reconnecting');
   shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(join(output,'setup-direct.png'),Buffer.from(shot.data,'base64'));
-  await evaluate(`document.getElementById('cancel-wifi').click();document.getElementById('cancel-passcode').click()`);
+  await evaluate(`document.getElementById('cancel-wifi').click()`);
   check(await evaluate(`document.getElementById('firmware-version').textContent==='1.0.1' &&
     document.getElementById('firmware-repository').textContent==='suzuking001/steering_sw' &&
     document.getElementById('firmware-check').disabled && !document.querySelector('#firmware-panel input')`),
@@ -652,5 +856,5 @@ try{
   check(errors.length===0,'no uncaught browser or fixture errors');
   console.log(`${checks} browser checks passed; screenshots: .pio/ui-tests/`);
 }catch(error){console.error(error);if(errors.length)console.error(errors);process.exitCode=1;}
-finally{if(ws)ws.close();if(chrome){chrome.kill('SIGTERM');await once(chrome,'exit').catch(()=>{});}server.closeAllConnections();server.close();await rm(profile,{recursive:true,force:true});}
+finally{if(ws)ws.close();if(chrome){chrome.kill('SIGTERM');await once(chrome,'exit').catch(()=>{});}server.closeAllConnections();server.close();await rm(profile,{recursive:true,force:true,maxRetries:5});}
 function cloneJSON(value){return JSON.parse(JSON.stringify(value));}
